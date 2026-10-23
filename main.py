@@ -33,6 +33,23 @@ def clean_container_storage(working_dir: str):
                 shutil.rmtree(path, ignore_errors=True)
             except Exception:
                 pass
+    # ล้าง __pycache__ ใน .local/lib ของคอนเทนเนอร์เพื่อคืนพื้นที่เพิ่ม ~35-50 MB
+    local_lib = os.path.join(working_dir, ".local", "lib")
+    if os.path.isdir(local_lib):
+        for root, dirs, _ in os.walk(local_lib):
+            for d in list(dirs):
+                if d in ("__pycache__", "tests", "test"):
+                    target_d = os.path.join(root, d)
+                    try:
+                        for r2, _, files2 in os.walk(target_d):
+                            for f2 in files2:
+                                try:
+                                    freed_bytes += os.path.getsize(os.path.join(r2, f2))
+                                except Exception:
+                                    pass
+                        shutil.rmtree(target_d, ignore_errors=True)
+                    except Exception:
+                        pass
     if freed_bytes > 0:
         print(f"🧹 [Storage Cleaner] ล้างไฟล์แคชขยะเรียบร้อย (คืนพื้นที่ {freed_bytes / (1024 * 1024):.1f} MB)", flush=True)
 
@@ -55,7 +72,7 @@ def run_supervisor():
             pass
 
         start_time = time.time()
-        process = subprocess.run([sys.executable, "-B", "discord_bot.py"], cwd=working_dir)
+        process = subprocess.run([sys.executable, "-B", "-W", "ignore", "discord_bot.py"], cwd=working_dir)
         elapsed = time.time() - start_time
 
         print(f"🔄 [Stock Bot Supervisor] Bot process finished (code {process.returncode}, ran for {elapsed:.1f}s).", flush=True)

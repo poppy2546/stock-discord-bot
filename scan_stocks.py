@@ -28,6 +28,8 @@ except Exception:
 
 import json
 import datetime
+import warnings
+warnings.filterwarnings("ignore", message=".*inplace.*")
 import yfinance as yf
 import pandas as pd
 import numpy as np
