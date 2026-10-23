@@ -69,6 +69,8 @@ _load_env()
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import warnings
+warnings.filterwarnings("ignore", message=".*inplace.*")
 import yfinance as yf
 try:
     yf.set_tz_cache_location(os.path.join(tempfile.gettempdir(), "yf_tz_cache"))
