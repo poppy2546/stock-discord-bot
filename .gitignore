@@ -1,0 +1,31 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment & secret files
+.env
+*.env
+discord_bot.py.bak
+*.tmp
+data/*.json
+!data/*.example.json
+
+
+# Generated reports & logs
+latest_report.txt
+*.log
+graph.html
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+deploy/
+*.lnk

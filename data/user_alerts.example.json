@@ -1,0 +1,14 @@
+{
+  "example_user_id_123": [
+    {
+      "id": "NVDA_250.00_gte",
+      "symbol": "NVDA",
+      "target_price": 250.0,
+      "condition": "gte",
+      "channel_id": null,
+      "created_at": "2026-10-15T02:00:00",
+      "initial_price": 230.44,
+      "triggered": false
+    }
+  ]
+}

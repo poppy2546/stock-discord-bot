@@ -1,0 +1,36 @@
+{
+  "updated_at": "2026-01-01T00:00:00+07:00",
+  "source": "Sample App Portfolio",
+  "portfolio_summary": {
+    "currency": "USD",
+    "total_cost_usd": 1000.00,
+    "total_value_usd": 1050.00,
+    "total_pnl_usd": 50.00,
+    "total_pnl_pct": 5.00,
+    "total_assets": 2
+  },
+  "holdings": {
+    "VOO": {
+      "shares": 1.0,
+      "avg_cost_usd": 500.00,
+      "total_cost_usd": 500.00,
+      "current_price_usd": 520.00,
+      "current_value_usd": 520.00,
+      "pnl_usd": 20.00,
+      "pnl_pct": 4.00,
+      "weight_pct": 50.00,
+      "category": "Core ETF"
+    },
+    "NVDA": {
+      "shares": 4.0,
+      "avg_cost_usd": 125.00,
+      "total_cost_usd": 500.00,
+      "current_price_usd": 132.50,
+      "current_value_usd": 530.00,
+      "pnl_usd": 30.00,
+      "pnl_pct": 6.00,
+      "weight_pct": 50.00,
+      "category": "Semiconductor"
+    }
+  }
+}
