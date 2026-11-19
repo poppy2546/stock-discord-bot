@@ -56,7 +56,8 @@ def send_windows_notification(buys, regime, phase="trading"):
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script, "-payload", b64_xml],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
         pass

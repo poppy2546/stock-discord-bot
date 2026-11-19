@@ -64,10 +64,15 @@ def run_supervisor():
         clean_container_storage(working_dir)
         print("🚀 [Stock Bot Supervisor] Launching Stock Advisor Bot...", flush=True)
         # ดึงโค้ดล่าสุดจาก Git แบบไม่ค้างรอถามรหัสผ่าน (GIT_TERMINAL_PROMPT=0)
+        # ข้าม reset --hard ถ้ามีไฟล์ที่ track อยู่ถูกแก้ไขค้างไว้ (กันโค้ดที่ยังไม่ได้ push หาย)
         try:
             git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
             subprocess.run(["git", "fetch", "origin", "main"], cwd=working_dir, env=git_env, timeout=10, capture_output=True)
-            subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=working_dir, env=git_env, timeout=5, capture_output=True)
+            dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=working_dir, env=git_env, timeout=5, capture_output=True, text=True)
+            if dirty.returncode == 0 and not dirty.stdout.strip():
+                subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=working_dir, env=git_env, timeout=5, capture_output=True)
+            elif dirty.stdout.strip():
+                print("⚠️ [Stock Bot Supervisor] พบไฟล์ที่แก้ไขค้างอยู่ ข้ามการ git reset --hard", flush=True)
         except Exception:
             pass
 

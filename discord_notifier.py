@@ -1,6 +1,9 @@
 import os
 import sys
+import time
 import urllib.request
+import urllib.error
+import urllib.parse
 import json
 
 def _load_env():
@@ -50,12 +53,72 @@ def _safe_print(msg):
         except Exception:
             pass
 
+_PRIVATE_MARKERS = (
+    "💼 ข้อมูลต้นทุนและพอร์ตของคุณ",   # รอบ 23:00
+    "💼 สรุปภาพรวมพอร์ตโฟลิโอของคุณ",  # รอบ 07:00
+    "🧮 จำลองผลหลังถัวเฉลี่ย",          # DCA Simulator (รอบ 20:00 ไม่มีหัวพอร์ต)
+)
+
 def _strip_private_portfolio(text):
-    marker = "💼 ข้อมูลต้นทุนและพอร์ตของคุณ"
-    if marker in text:
-        parts = text.split(marker)
-        return parts[0].strip()
-    return text
+    """ตัดส่วนข้อมูลพอร์ตส่วนตัวออก (เก็บส่วนหมายเหตุ 📌 ท้ายรายงานไว้)"""
+    idxs = [text.find(m) for m in _PRIVATE_MARKERS if m in text]
+    if not idxs:
+        return text
+    start = min(idxs)
+    tail_idx = text.find("\n📌", start)
+    tail = text[tail_idx:] if tail_idx != -1 else ""
+    return (text[:start].rstrip() + "\n" + tail).strip()
+
+_ALLOWED_WEBHOOK_HOSTS = {
+    "discord.com",
+    "discordapp.com",
+    "canary.discord.com",
+    "ptb.discord.com",
+}
+
+
+def _is_valid_discord_webhook_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() in _ALLOWED_WEBHOOK_HOSTS
+            and parsed.path.startswith("/api/webhooks/")
+        )
+    except Exception:
+        return False
+
+
+def _post_discord_json(url, payload, headers, max_retries=3):
+    data = json.dumps(payload).encode("utf-8")
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return json.loads(res.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_retries - 1:
+                retry_after = 1.5
+                try:
+                    body = json.loads(e.read().decode("utf-8") or "{}")
+                    retry_after = float(body.get("retry_after", 1.5)) + 0.2
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        e.close()
+                    except Exception:
+                        pass
+                time.sleep(min(retry_after, 10.0))
+                continue
+            try:
+                e.close()
+            except Exception:
+                pass
+            raise
+    return None
 
 def send_discord_dm(recipient_id, message_text, bot_token=None):
     token = bot_token or os.getenv("DISCORD_BOT_TOKEN")
@@ -71,15 +134,12 @@ def send_discord_dm(recipient_id, message_text, bot_token=None):
 
     channel_id = None
     try:
-        req = urllib.request.Request(
+        res_data = _post_discord_json(
             "https://discord.com/api/v10/users/@me/channels",
-            data=json.dumps({"recipient_id": str(recipient_id)}).encode("utf-8"),
-            headers=headers,
-            method="POST"
+            {"recipient_id": str(recipient_id)},
+            headers
         )
-        with urllib.request.urlopen(req, timeout=10) as res:
-            res_data = json.loads(res.read().decode("utf-8"))
-            channel_id = res_data.get("id")
+        channel_id = (res_data or {}).get("id")
     except Exception as e:
         _safe_print(f"❌ Failed to create Discord DM channel for {recipient_id}: {e}")
         return False
@@ -89,16 +149,15 @@ def send_discord_dm(recipient_id, message_text, bot_token=None):
 
     chunks = _chunk_text(message_text)
     success = True
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         try:
-            req = urllib.request.Request(
+            if idx > 0:
+                time.sleep(0.35)
+            _post_discord_json(
                 f"https://discord.com/api/v10/channels/{channel_id}/messages",
-                data=json.dumps({"content": chunk}).encode("utf-8"),
-                headers=headers,
-                method="POST"
+                {"content": chunk},
+                headers
             )
-            with urllib.request.urlopen(req, timeout=10) as res:
-                pass
         except Exception as e:
             _safe_print(f"❌ Failed to send Discord DM chunk: {e}")
             success = False
@@ -106,8 +165,11 @@ def send_discord_dm(recipient_id, message_text, bot_token=None):
     return success
 
 def send_discord_webhook(report_text, webhook_url=None):
-    url = webhook_url or os.getenv("DISCORD_WEBHOOK_URL")
+    url = (webhook_url or os.getenv("DISCORD_WEBHOOK_URL") or "").strip()
     if not url:
+        return False
+    if not _is_valid_discord_webhook_url(url):
+        _safe_print("⚠️ Invalid DISCORD_WEBHOOK_URL: must be an https://discord.com/api/webhooks/... URL")
         return False
 
     headers = {
@@ -117,16 +179,11 @@ def send_discord_webhook(report_text, webhook_url=None):
 
     chunks = _chunk_text(report_text)
     success = True
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps({"content": chunk}).encode("utf-8"),
-                headers=headers,
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                pass
+            if idx > 0:
+                time.sleep(0.35)
+            _post_discord_json(url, {"content": chunk}, headers)
         except Exception as e:
             _safe_print(f"Failed to send Discord webhook chunk: {e}")
             success = False

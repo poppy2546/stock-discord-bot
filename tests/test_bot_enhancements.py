@@ -399,5 +399,455 @@ class TestBotEnhancements(unittest.TestCase):
         self.assertTrue(any("RAM" in f for f in field_names))
         self.assertTrue(any("รีสตาร์ต" in f for f in field_names))
 
+    def test_nan_close_handling_and_newer_local_portfolio_preservation(self):
+        """Ensure trailing NaN row in Yahoo Finance does not produce NaN price, and Supabase restore does not overwrite newer local portfolio"""
+        import pandas as pd
+        import numpy as np
+        import math
+        import scan_stocks
+
+        dates = pd.date_range("2026-01-01", periods=65, freq="B")
+        closes = list(np.linspace(100.0, 130.0, 64)) + [np.nan]
+        df = pd.DataFrame({
+            "Open": closes,
+            "High": closes,
+            "Low": closes,
+            "Close": closes,
+            "Volume": [100000.0] * 64 + [np.nan],
+        }, index=dates)
+        tech = scan_stocks.calculate_technical(df)
+        self.assertIn("price", tech)
+        self.assertFalse(math.isnan(tech["price"]))
+        self.assertAlmostEqual(tech["price"], 130.0, places=2)
+        self.assertFalse(math.isnan(tech["ema_dist"]))
+
+        # Test in-place DCA buy mode in add_user_portfolio_holding
+        test_uid = "unit_test_user_888"
+        discord_bot.clear_user_portfolio(test_uid)
+        discord_bot.add_user_portfolio_holding(test_uid, "GOOGL", 1.0, 300.0, "Big Tech", mode="set")
+        discord_bot.add_user_portfolio_holding(test_uid, "GOOGL", 1.0, 200.0, "Big Tech", mode="buy", spend_thb=6700.0)
+        p_buy = discord_bot.get_user_portfolio_data(test_uid)
+        self.assertAlmostEqual(p_buy["holdings"]["GOOGL"]["shares"], 2.0, places=5)
+        self.assertAlmostEqual(p_buy["holdings"]["GOOGL"]["avg_cost_usd"], 250.0, places=2)
+        self.assertAlmostEqual(p_buy["holdings"]["GOOGL"]["total_cost_usd"], 500.0, places=2)
+        ports = discord_bot.load_user_portfolios()
+        ports.pop(test_uid, None)
+        discord_bot.save_user_portfolios(ports)
+
+        # Test format_dca_simulation
+        sim = scan_stocks.format_dca_simulation(
+            {"GOOGL": {"shares": 0.67, "avg_cost_usd": 333.74, "total_cost_usd": 223.64, "current_price_usd": 279.84, "pnl_pct": -16.15}},
+            788.07,
+            33.67
+        )
+        self.assertTrue(len(sim) >= 2)
+        self.assertIn("GOOGL", sim[1])
+
+class TestLogicFixes(unittest.TestCase):
+    """Regression tests สำหรับบั๊กที่แก้ไข (sweep, RSI, EMA200, regime, privacy, shared rules)"""
+
+    def _df(self, opens, highs, lows, closes, n=60):
+        import pandas as pd
+        dates = pd.date_range("2026-01-01", periods=n, freq="D")
+        return pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": [1000] * n}, index=dates)
+
+    def test_amd_sweep_requires_close_above_prior_low(self):
+        import scan_stocks
+        # ทะลุ low เดิม (100) แล้วปิดใต้ low ที่ 90 แม้มีไส้ล่างยาว -> Breakdown ไม่ใช่ sweep
+        df = self._df([102.0]*59 + [95.0], [105.0]*59 + [96.0], [100.0]*59 + [85.0], [100.0]*59 + [90.0])
+        self.assertFalse(scan_stocks.calculate_technical(df)["amd_sweep"])
+        # ทะลุ low เดิมแล้วดึงกลับมาปิดเหนือ low -> sweep จริง
+        df2 = self._df([102.0]*59 + [101.0], [105.0]*59 + [103.0], [100.0]*59 + [97.0], [101.0]*59 + [102.0])
+        self.assertTrue(scan_stocks.calculate_technical(df2)["amd_sweep"])
+
+    def test_bsl_sweep_ignores_strong_breakout(self):
+        import scan_stocks
+        # Breakout ปิด 117 เหนือ high เดิม 102 แม้มีไส้บน -> ไม่ใช่กับดัก
+        df = self._df([100.0]*59 + [105.0], [102.0]*59 + [125.0], [98.0]*59 + [104.0], [100.0]*59 + [117.0])
+        self.assertFalse(scan_stocks.calculate_technical(df)["bsl_sweep"])
+        # แทงทะลุแล้วปิดกลับใต้ high เดิม -> กับดัก
+        df2 = self._df([100.0]*59 + [101.0], [102.0]*59 + [106.0], [98.0]*59 + [99.0], [100.0]*59 + [100.5])
+        self.assertTrue(scan_stocks.calculate_technical(df2)["bsl_sweep"])
+
+    def test_rsi_uses_wilder_and_short_history_has_no_ema200(self):
+        import scan_stocks
+        import numpy as np
+        closes = list(np.linspace(100, 130, 60))
+        tech = scan_stocks.calculate_technical(self._df(closes, closes, closes, closes))
+        self.assertGreater(tech["rsi"], 90)  # ขึ้นล้วนต้อง RSI สูงมาก
+        self.assertEqual(tech["ema200"], 0.0)
+
+    def test_decide_action_downtrend_skipped_without_ema200(self):
+        import scan_stocks
+        macro = {"hurdle": 80, "regime": "Risk-On (Bull)"}
+        fv = {"fund_score": 25, "risk_score": 9}
+        tech = {"price": 90, "ema50": 100, "ema200": 0.0, "rsi": 45, "ema_dist": -3}
+        _, raw, final, ov, _ = scan_stocks.decide_action("XYZ", 85, tech, fv, macro, False)
+        self.assertEqual((raw, final, ov), ("BUY", "BUY", False))
+        tech["ema200"] = 110
+        _, _, final, ov, _ = scan_stocks.decide_action("XYZ", 85, tech, fv, macro, False)
+        self.assertEqual((final, ov), ("WAIT", True))
+
+    def test_discord_bot_shares_rules_with_scanner(self):
+        # ETF ใน Risk-Off + RSI < 40 ต้องได้ hurdle 74 เหมือน scan_stocks
+        macro = {"hurdle": 88, "regime": "Risk-Off (Correction / Caution)", "macro_score": 7}
+        fv = discord_bot.analyze_all_around_fundamentals(None, is_etf=True)
+        tech = {"price": 100, "ema20": 102, "ema50": 101, "ema200": 95, "ema_dist": -2, "rsi": 35, "score": 17}
+        ev = discord_bot.evaluate_stock({"ticker": "VOO", "tech": tech, "fund_val": fv}, macro)
+        self.assertEqual(ev["score"], 25 + 16 + 17 + 7 + 9 + 5)
+        self.assertEqual(ev["final_action"], "BUY")
+
+    def test_morning_report_neutral_regime(self):
+        import scan_stocks
+        macro = {"regime": "Neutral / Consolidation", "hurdle": 83, "vix": 19.5, "10y_yield": 4.1, "macro_score": 11, "fx_thb": 33.67}
+        rep = scan_stocks.generate_morning_report([], macro, {}, 1000, 0.2, 0.45, "now")
+        self.assertIn("Neutral/Sideway", rep)
+        self.assertNotIn("Risk-Off", rep)
+
+    def test_webhook_strips_all_private_sections(self):
+        import discord_notifier
+        for header in ("💼 สรุปภาพรวมพอร์ตโฟลิโอของคุณ (Dime!):", "💼 ข้อมูลต้นทุนและพอร์ตของคุณ (Dime!):", "🧮 จำลองผลหลังถัวเฉลี่ย (x):"):
+            txt = f"Public\n{header}\nSECRET $123\n\n📌 หมายเหตุ\n  • note"
+            out = discord_notifier._strip_private_portfolio(txt)
+            self.assertNotIn("SECRET", out)
+            self.assertIn("Public", out)
+            self.assertIn("📌 หมายเหตุ", out)
+
+    def test_dca_sim_skips_locked_semi(self):
+        import scan_stocks
+        h = {"NVDA": {"shares": 1, "avg_cost_usd": 200, "total_cost_usd": 200, "current_price_usd": 150, "pnl_pct": -25},
+             "MSFT": {"shares": 1, "avg_cost_usd": 400, "total_cost_usd": 400, "current_price_usd": 350, "pnl_pct": -12.5}}
+        sim = "\n".join(scan_stocks.format_dca_simulation(h, 1000, 33.67, skip_symbols=scan_stocks.SEMI_TICKERS))
+        self.assertIn("MSFT", sim)
+        self.assertNotIn("NVDA", sim)
+
+    def test_quant_enhancements_atr_vdu_and_rr(self):
+        import scan_stocks
+        import pandas as pd
+        import numpy as np
+
+        # 1. Test ATR and Volume Dry-Up
+        dates = pd.date_range("2026-01-01", periods=60, freq="B")
+        close = pd.Series(np.linspace(100, 120, 60), index=dates)
+        # Pullback near EMA20 with low volume (VDU)
+        close.iloc[-1] = close.iloc[-2] * 0.995
+        vol = [1_000_000] * 59 + [400_000]  # RVOL ~ 0.4
+        df = pd.DataFrame({"Open": close, "High": close + 2.0, "Low": close - 2.0, "Close": close, "Volume": vol}, index=dates)
+
+        tech = scan_stocks.calculate_technical(df)
+        self.assertIn("atr", tech)
+        self.assertGreater(tech["atr"], 0.0)
+        self.assertTrue(tech.get("volume_dryup"))
+
+        # 2. Test compute_entry_zone returns dynamic stop loss, target and R:R ratio
+        ent = scan_stocks.compute_entry_zone(tech)
+        self.assertIn("target_price", ent)
+        self.assertIn("rr_ratio", ent)
+        self.assertGreater(ent["target_price"], tech["price"])
+        self.assertLess(ent["stop_loss"], tech["price"])
+        self.assertGreater(ent["rr_ratio"], 1.0)
+        self.assertGreater(ent.get("chandelier_stop", 0.0), 0.0)
+
+    def test_offensive_and_defensive_pro_techniques(self):
+        import scan_stocks
+        import pandas as pd
+        import numpy as np
+
+        # 1. Relative Strength (RS Leader vs RS Laggard)
+        tech_leader = {"raw_tech_score": 15, "score": 15, "ret_20d": 8.0, "rsi": 55.0}
+        macro = {"spx_ret_20d": 2.0, "regime": "Risk-On (Bull)", "hurdle": 80}
+        scan_stocks.apply_relative_strength(tech_leader, macro)
+        self.assertTrue(tech_leader["rs_leader"])
+        self.assertFalse(tech_leader["rs_laggard"])
+        self.assertEqual(tech_leader["score"], 17)
+
+        tech_lag = {"raw_tech_score": 15, "score": 15, "ret_20d": -4.5, "rsi": 48.0}
+        scan_stocks.apply_relative_strength(tech_lag, macro)
+        self.assertTrue(tech_lag["rs_laggard"])
+        self.assertFalse(tech_lag["rs_leader"])
+        self.assertEqual(tech_lag["score"], 13)
+
+        # 2. Bullish FVG detection (3-candle gap that holds)
+        dates = pd.date_range("2026-01-01", periods=60, freq="B")
+        closes = np.linspace(100, 110, 60)
+        highs = closes + 0.5
+        lows = closes - 0.5
+        # Create Bullish FVG at -3 (idx-2=-5, idx=-3): low[-3] > high[-5] * 1.002
+        highs[-5] = 108.0
+        lows[-4] = 108.2
+        closes[-4] = 111.0
+        highs[-4] = 111.5
+        lows[-3] = 109.0  # gap [108.0, 109.0]
+        closes[-3] = 110.5
+        lows[-2] = 109.2
+        closes[-2] = 109.5
+        lows[-1] = 108.5
+        closes[-1] = 109.2  # retesting right near top of FVG (109.0)
+        df_fvg = pd.DataFrame({
+            "Open": closes - 0.2, "High": highs, "Low": lows, "Close": closes, "Volume": [1_000_000] * 60
+        }, index=dates)
+        t_fvg = scan_stocks.calculate_technical(df_fvg)
+        self.assertTrue(t_fvg["bullish_fvg"])
+        self.assertIsNotNone(t_fvg["fvg_zone"])
+
+        # 3. Bearish Divergence override in decide_action
+        fv = {"fund_score": 26, "risk_score": 9}
+        tech_bdiv = {
+            "price": 120.0, "ema20": 118.0, "ema50": 112.0, "ema200": 100.0,
+            "rsi": 65.0, "ema_dist": 1.7, "atr": 2.0, "bearish_divergence": True
+        }
+        _, raw_act, final_act, ov, reason = scan_stocks.decide_action("NVDA", 86, tech_bdiv, fv, macro, False)
+        self.assertEqual(raw_act, "BUY")
+        self.assertEqual(final_act, "HOLD")
+        self.assertTrue(ov)
+        self.assertIn("Bearish RSI Divergence", reason)
+
+        # 4. 1%-2% Risk & Volatility Position Sizing
+        # Wide stop loss (15% distance: entry 100, stop 85) should scale down position size
+        sizing_wide = scan_stocks.compute_position_size(
+            100.0, 85.0, cash_thb=1000.0, fx_thb=34.0,
+            portfolio_value_usd=2000.0, regime="Risk-Off (Correction)"
+        )
+        self.assertLess(sizing_wide["recommended_thb"], 1000.0)
+        self.assertGreater(sizing_wide["stop_pct"], 14.0)
+
+    def test_audit_bug_fixes(self):
+        """Regression tests for 11 bugs/weaknesses found during logic audit"""
+        import scan_stocks
+        import discord_notifier
+        import urllib.error
+
+        # 1. Timezone-aware ISO timestamp comparison (UTC vs +07:00)
+        # 2026-05-01T10:00:00+00:00 (17:00 TH) is NEWER than 2026-05-01T12:00:00+07:00 (12:00 TH),
+        # even though string "10:00" < "12:00"
+        ts_utc = scan_stocks._parse_iso_ts("2026-05-01T10:00:00+00:00")
+        ts_th = scan_stocks._parse_iso_ts("2026-05-01T12:00:00+07:00")
+        self.assertGreater(ts_utc, ts_th)
+
+        # 2. Scanner and Bot ETF score consistency (both fund_score == 25)
+        f_scan = scan_stocks.analyze_fundamentals_and_valuation(None, is_etf=True)
+        f_bot = discord_bot.analyze_all_around_fundamentals(None, is_etf=True)
+        self.assertEqual(f_scan["fund_score"], 25)
+        self.assertEqual(f_scan["fund_score"], f_bot["fund_score"])
+
+        # 3. Semi cap override & portfolio_fit penalty in discord_bot.evaluate_stock
+        macro = {"hurdle": 80, "regime": "Risk-On (Bull)", "macro_score": 14, "spx_ret_20d": 1.0}
+        fv_nvda = {
+            "is_etf": False, "sector_raw": "Technology", "sector_display": "เทคโนโลยี",
+            "fund_score": 28, "val_score": 16, "risk_score": 10, "portfolio_fit": 5,
+            "fwd_pe": 30.0, "peg": 1.2, "rev_growth": "50%"
+        }
+        tech_nvda = {"price": 130.0, "ema20": 128.0, "ema50": 120.0, "ema200": 100.0, "rsi": 58.0, "ema_dist": 1.5, "atr": 3.0, "score": 18, "ret_20d": 5.0}
+        ev_locked = discord_bot.evaluate_stock({"ticker": "NVDA", "tech": tech_nvda, "fund_val": fv_nvda}, macro, semi_exposure=0.50)
+        self.assertEqual(ev_locked["portfolio_fit"], 1)
+        self.assertEqual(ev_locked["raw_action"], "BUY")
+        self.assertEqual(ev_locked["final_action"], "HOLD")
+        self.assertTrue(ev_locked["override"])
+
+        # 4. Global guild check allows DMs and works when MY_GUILD_ID is None
+        class DummyCtx:
+            def __init__(self, guild):
+                self.guild = guild
+        orig_gid = discord_bot.MY_GUILD_ID
+        try:
+            discord_bot.MY_GUILD_ID = 111
+            self.assertTrue(asyncio.run(discord_bot.globally_block_unauthorized_guilds(DummyCtx(None))))
+            discord_bot.MY_GUILD_ID = None
+            self.assertTrue(asyncio.run(discord_bot.globally_block_unauthorized_guilds(DummyCtx(MagicMock(id=999)))))
+        finally:
+            discord_bot.MY_GUILD_ID = orig_gid
+
+        # 5. Thread-local session isolation in scan_stocks.get_session()
+        s_main = scan_stocks.get_session()
+        worker_sessions = []
+        import threading
+        t = threading.Thread(target=lambda: worker_sessions.append(scan_stocks.get_session()))
+        t.start()
+        t.join()
+        if s_main is not None and worker_sessions[0] is not None:
+            self.assertIsNot(s_main, worker_sessions[0])
+
+        # 6. Discord notifier 429 retry logic
+        calls = []
+        def fake_urlopen(req, timeout=10):
+            calls.append(1)
+            if len(calls) == 1:
+                fp = MagicMock()
+                fp.read.return_value = b'{"retry_after": 0.01}'
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, fp)
+            resp = MagicMock()
+            resp.read.return_value = b'{"id": "chan_1"}'
+            resp.__enter__.return_value = resp
+            return resp
+
+        with patch("discord_notifier.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = discord_notifier._post_discord_json("https://discord.com/api/v10/test", {"content": "hi"}, {})
+            self.assertEqual(res.get("id"), "chan_1")
+            self.assertEqual(len(calls), 2)
+
+    def test_security_hardening_and_edge_cases(self):
+        """Regression tests for security audit fixes & stability bugs"""
+        import math
+        import pandas as pd
+        import discord_notifier
+
+        # 1. Ticker injection & traversal rejection
+        for bad in ("@everyone", "<@123456>", "[click](https://evil.com)", "NVDA\n@here", "../../etc/passwd", "NVDA?x=1", "A" * 30):
+            self.assertEqual(discord_bot.clean_ticker(bad), "", f"Should reject malicious ticker: {bad!r}")
+        self.assertEqual(discord_bot.clean_ticker("S&P 500"), "SPY")
+        self.assertEqual(discord_bot.clean_ticker("^GSPC"), "^GSPC")
+
+        # 2. NaN / Inf / bool rejection in portfolio & alerts
+        test_uid = "unit_test_user_888"
+        self.assertFalse(discord_bot.add_user_portfolio_holding(test_uid, "NVDA", float("nan"), 100.0))
+        self.assertFalse(discord_bot.add_user_portfolio_holding(test_uid, "NVDA", float("inf"), 100.0))
+        self.assertFalse(discord_bot.add_user_portfolio_holding(test_uid, "NVDA", 1.0, float("nan")))
+        self.assertFalse(discord_bot.add_user_portfolio_holding(test_uid, "", 1.0, 100.0))
+        ok_nan, _ = discord_bot.add_user_alert(test_uid, 123, "NVDA", float("nan"))
+        self.assertFalse(ok_nan)
+        ok_inf, _ = discord_bot.add_user_alert(test_uid, 123, "NVDA", float("inf"))
+        self.assertFalse(ok_inf)
+
+        # 3. Slash command guild authorization check & admin check
+        class DummyInter:
+            def __init__(self, gid):
+                self.guild_id = gid
+                self.response = MagicMock()
+                self.response.is_done.return_value = True
+
+        orig_gid = discord_bot.MY_GUILD_ID
+        try:
+            discord_bot.MY_GUILD_ID = 111
+            self.assertTrue(asyncio.run(discord_bot._tree_interaction_check(DummyInter(None))))
+            self.assertTrue(asyncio.run(discord_bot._tree_interaction_check(DummyInter(111))))
+            self.assertFalse(asyncio.run(discord_bot._tree_interaction_check(DummyInter(999))))
+
+            ext_admin = MagicMock(id=55555)
+            ext_admin.guild_permissions.administrator = True
+            ext_guild = MagicMock(id=999)
+            ext_chan = MagicMock()
+            ext_chan.permissions_for.return_value = MagicMock(administrator=True)
+            with patch.object(discord_bot, "is_portfolio_owner", return_value=False):
+                self.assertFalse(asyncio.run(discord_bot._is_admin_or_owner(ext_admin, ext_guild, ext_chan)))
+        finally:
+            discord_bot.MY_GUILD_ID = orig_gid
+
+        # 4. Webhook SSRF validation
+        self.assertFalse(discord_notifier.send_discord_webhook("hi", "http://127.0.0.1:8080/steal"))
+        self.assertFalse(discord_notifier.send_discord_webhook("hi", "https://evil.example/api/webhooks/1/2"))
+        self.assertTrue(discord_notifier._is_valid_discord_webhook_url("https://discord.com/api/webhooks/123/abc"))
+
+        # 5. Supabase config validation
+        self.assertFalse(discord_bot._is_valid_supabase_config("http://example.supabase.co", "k", "user_profiles"))
+        self.assertFalse(discord_bot._is_valid_supabase_config("https://example.supabase.co", "k", "user_profiles;DROP"))
+        self.assertTrue(discord_bot._is_valid_supabase_config("https://example.supabase.co", "k", "user_profiles"))
+
+        # 6. History & Price embed safety against zero close / trailing NaN / empty ticker
+        self.assertIn("ไม่ถูกต้อง", discord_bot.build_price_embed("@@@").title)
+        self.assertIn("ไม่ถูกต้อง", discord_bot.build_history_embed("@@@").title)
+        sym_zero = "ZERO_TEST"
+        dates = pd.date_range("2026-01-01", periods=3, freq="B")
+        zero_df = pd.DataFrame({
+            "Open": [0.0, 10.0, float("nan")],
+            "High": [0.0, 11.0, float("nan")],
+            "Low": [0.0, 9.0, float("nan")],
+            "Close": [0.0, 10.0, float("nan")],
+            "Volume": [100.0, 200.0, float("nan")],
+        }, index=dates)
+        with discord_bot._ticker_cache_lock:
+            discord_bot._ticker_cache[sym_zero] = {
+                "timestamp": time.time(),
+                "data": {"ticker": sym_zero, "is_etf": False, "tech": {"price": 10.0}, "fund_val": {}, "hist": zero_df},
+            }
+        try:
+            h_emb = discord_bot.build_history_embed(sym_zero, "5d")
+            self.assertIn(sym_zero, h_emb.title)
+            self.assertNotIn("nan", h_emb.description.lower())
+        finally:
+            with discord_bot._ticker_cache_lock:
+                discord_bot._ticker_cache.pop(sym_zero, None)
+
+        # 7. Watchlist toggle respects 50-item cap
+        wl = discord_bot.load_user_watchlists()
+        wl[test_uid] = [f"T{i}" for i in range(50)]
+        discord_bot._write_json_local_only(discord_bot.USER_WATCHLIST_FILE, wl)
+        try:
+            ok_wl, _, _ = discord_bot._toggle_watchlist_ticker(test_uid, "NVDA")
+            self.assertFalse(ok_wl)
+        finally:
+            wl = discord_bot.load_user_watchlists()
+            wl.pop(test_uid, None)
+            discord_bot._write_json_local_only(discord_bot.USER_WATCHLIST_FILE, wl)
+
+    def test_qol_cash_autocomplete_confirm_and_error_handlers(self):
+        """Tests for v2.9.2 QoL: cash management, contextual autocompletes, confirm view, error handlers"""
+        from unittest.mock import AsyncMock
+        test_uid = "unit_test_qol_999"
+
+        # 1. Cash management: set / add / sub + invalid input rejection
+        try:
+            ok, val = discord_bot.set_user_portfolio_cash(test_uid, 5000.0, mode="set")
+            self.assertTrue(ok)
+            self.assertAlmostEqual(val, 5000.0)
+
+            ok, val = discord_bot.set_user_portfolio_cash(test_uid, 1250.5, mode="add")
+            self.assertTrue(ok)
+            self.assertAlmostEqual(val, 6250.5)
+
+            ok, val = discord_bot.set_user_portfolio_cash(test_uid, 10000.0, mode="sub")
+            self.assertTrue(ok)
+            self.assertAlmostEqual(val, 0.0)  # floored at 0
+
+            # Invalid values
+            self.assertFalse(discord_bot.set_user_portfolio_cash(test_uid, -100.0, mode="set")[0])
+            self.assertFalse(discord_bot.set_user_portfolio_cash(test_uid, float("nan"), mode="add")[0])
+            self.assertFalse(discord_bot.set_user_portfolio_cash(test_uid, float("inf"), mode="set")[0])
+            self.assertFalse(discord_bot.set_user_portfolio_cash(test_uid, 100.0, mode="badmode")[0])
+
+            # 2. Contextual autocomplete (portfolio + alert + ticker)
+            discord_bot.add_user_portfolio_holding(test_uid, "PLTR", 2.0, 25.0, "AI")
+            discord_bot.add_user_alert(test_uid, 123, "AMD", 200.0, current_price=150.0)
+
+            fake_inter = MagicMock()
+            fake_inter.user.id = test_uid
+            port_choices = asyncio.run(discord_bot.portfolio_autocomplete(fake_inter, ""))
+            self.assertTrue(any(c.value == "PLTR" for c in port_choices))
+
+            alert_choices = asyncio.run(discord_bot.alert_autocomplete(fake_inter, ""))
+            self.assertTrue(any(c.value == "AMD" for c in alert_choices))
+
+            ticker_choices = asyncio.run(discord_bot.ticker_autocomplete(fake_inter, "PL"))
+            self.assertTrue(any(c.value == "PLTR" and "พอร์ต" in c.name for c in ticker_choices))
+
+            # 3. Global error handlers do not leak raw exception details
+            err_inter = MagicMock()
+            err_inter.command.name = "check"
+            err_inter.response.is_done.return_value = False
+            err_inter.response.send_message = AsyncMock()
+            asyncio.run(discord_bot.on_app_command_error(err_inter, discord_bot.app_commands.AppCommandError("SECRET_SQL_TOKEN")))
+            sent_msg = err_inter.response.send_message.call_args[0][0]
+            self.assertNotIn("SECRET_SQL_TOKEN", sent_msg)
+
+            # 4. ConfirmActionView enforces user ownership
+            async def _run_confirm_check():
+                called = {"ok": False}
+                async def _cb(inter):
+                    called["ok"] = True
+                cv = discord_bot.ConfirmActionView(test_uid, _cb)
+                other = MagicMock()
+                other.user.id = "other_user_123"
+                other.response.send_message = AsyncMock()
+                await cv.confirm_btn.callback(other)
+                self.assertFalse(called["ok"])
+                other.response.send_message.assert_awaited_once()
+            asyncio.run(_run_confirm_check())
+        finally:
+            p = discord_bot.load_user_portfolios()
+            p.pop(test_uid, None)
+            discord_bot._write_json_local_only(discord_bot.USER_PORTFOLIO_FILE, p)
+            a = discord_bot.load_user_alerts()
+            a.pop(test_uid, None)
+            discord_bot._write_json_local_only(discord_bot.USER_ALERT_FILE, a)
+
 if __name__ == '__main__':
     unittest.main()

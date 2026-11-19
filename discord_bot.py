@@ -1,6 +1,7 @@
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 # Aggressive memory & storage trim for Linux/Docker (bot-hosting.net)
 os.environ["MALLOC_TRIM_THRESHOLD_"] = "65536"
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -16,12 +17,57 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-# Safe standard output configuration (supports pythonw and UTF-8 on Windows)
+# Safe standard output configuration (supports pythonw with rotating file log + UTF-8 on Windows)
 _WAS_STARTED_AS_PYTHONW = (sys.stdout is None)
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w", encoding="utf-8")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdout is None or sys.stderr is None:
+    try:
+        import logging
+        from logging.handlers import RotatingFileHandler
+        _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(_log_dir, exist_ok=True)
+        _rot_handler = RotatingFileHandler(
+            os.path.join(_log_dir, "bot.log"),
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        _rot_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        _file_logger = logging.getLogger("stock_bot_stdio")
+        _file_logger.setLevel(logging.INFO)
+        _file_logger.propagate = False
+        _file_logger.addHandler(_rot_handler)
+
+        class _LoggerStream:
+            def __init__(self, logger):
+                self._logger = logger
+                self._buf = ""
+                self.encoding = "utf-8"
+
+            def write(self, msg):
+                if not msg:
+                    return 0
+                self._buf += str(msg)
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    if line.strip():
+                        self._logger.info(line)
+                return len(msg)
+
+            def flush(self):
+                if self._buf.strip():
+                    self._logger.info(self._buf.strip())
+                    self._buf = ""
+
+        _log_stream = _LoggerStream(_file_logger)
+        if sys.stdout is None:
+            sys.stdout = _log_stream
+        if sys.stderr is None:
+            sys.stderr = _log_stream
+    except Exception:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -78,9 +124,11 @@ except Exception:
     pass
 
 from scan_stocks import (
-    MACRO_TICKERS,
+    MACRO_TICKERS, SEMI_TICKERS, TRUE_SEMI_CAP,
     calculate_technical, analyze_macro,
-    get_session
+    get_session, decide_action, compute_entry_zone,
+    apply_relative_strength, compute_position_size,
+    _parse_iso_ts
 )
 
 # Comprehensive US Market Sector Mapping (11 Official GICS Sectors + ETF)
@@ -120,8 +168,11 @@ USER_WATCHLIST_FILE = _resolve_data_path("user_watchlists.json")
 USER_ALERT_FILE = _resolve_data_path("user_alerts.json")
 USER_PORTFOLIO_FILE = _resolve_data_path("user_portfolios.json")
 PORTFOLIO_FILE = _resolve_data_path("portfolio_holdings.json")
-_file_lock = threading.Lock()
+_file_lock = threading.RLock()
+_supabase_sync_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="stock_worker")
+# แยก pool สำหรับงานย่อย (fetch รายตัว) ที่ถูกเรียกจากงานใน _executor เพื่อกัน Thread Deadlock
+_fetch_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="stock_fetch")
 _json_mem_cache = {}
 
 def _read_json_cached(filepath, default_factory=dict):
@@ -148,11 +199,26 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_KEY = (
     os.getenv("SUPABASE_KEY")
     or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    or os.getenv("SUPABASE_ANON_KEY")
     or ""
 ).strip()
 SUPABASE_TABLE = (os.getenv("SUPABASE_TABLE") or "user_profiles").strip()
-_SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+_RE_SQL_IDENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
+
+def _is_valid_supabase_config(url: str, key: str, table: str) -> bool:
+    if not (url and key and table and _RE_SQL_IDENT.match(table)):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https" and bool(host):
+            return True
+        if parsed.scheme == "http" and host in {"localhost", "127.0.0.1"}:
+            return True
+    except Exception:
+        pass
+    return False
+
+_SUPABASE_ENABLED = _is_valid_supabase_config(SUPABASE_URL, SUPABASE_KEY, SUPABASE_TABLE)
 
 USER_DATA_FILES = {
     "user_watchlists": USER_WATCHLIST_FILE,
@@ -163,67 +229,88 @@ _suppress_cloud_sync = False
 
 def _write_json_local_only(filepath, data):
     with _file_lock:
+        temp_path = None
         try:
-            raw = json.dumps(data, ensure_ascii=False, indent=2)
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "w", encoding="utf-8") as f:
+            raw = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)
+            target_dir = os.path.dirname(os.path.abspath(filepath))
+            os.makedirs(target_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=target_dir, prefix=".tmp_", suffix=".json", delete=False
+            ) as f:
+                temp_path = f.name
                 f.write(raw)
             os.replace(temp_path, filepath)
             mtime = os.path.getmtime(filepath)
             _json_mem_cache[filepath] = {'mtime': mtime, 'raw': raw}
         except Exception as e:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
             print(f"Error saving {filepath}: {e}")
 
 def _supabase_upsert_all_users():
     """ซิงค์ข้อมูลผู้ใช้ทั้งหมดขึ้นตาราง user_profiles บน Supabase แบบแยกแถวรายคน"""
-    if not _SUPABASE_ENABLED:
+    if not (_SUPABASE_ENABLED and _is_valid_supabase_config(SUPABASE_URL, SUPABASE_KEY, SUPABASE_TABLE)):
         return False
-    try:
-        watchlists = _read_json_cached(USER_WATCHLIST_FILE, dict)
-        portfolios = _read_json_cached(USER_PORTFOLIO_FILE, dict)
-        alerts = _read_json_cached(USER_ALERT_FILE, dict)
-        owner_port = _read_json_cached(PORTFOLIO_FILE, dict)
-        owner_uid = str(DISCORD_OWNER_ID or owner_port.get("owner_id") or "").strip()
-        if owner_uid and owner_port.get("holdings") and not portfolios.get(owner_uid):
-            portfolios = dict(portfolios)
-            portfolios[owner_uid] = owner_port
-        all_uids = (set(watchlists.keys()) | set(portfolios.keys()) | set(alerts.keys())) - {"unit_test_user_888", "test_user_999", "friend_123"}
-        if not all_uids:
-            return True
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        rows = [
-            {
-                "user_id": str(uid),
-                "watchlist": watchlists.get(uid, []),
-                "portfolio": portfolios.get(uid, {}),
-                "alerts": alerts.get(uid, []),
-                "updated_at": now_iso,
-            }
-            for uid in all_uids
-        ]
-        url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=user_id"
-        body = json.dumps(rows, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
-    except Exception as e:
-        print(f"⚠️ Supabase upsert warning: {e}", flush=True)
-        return False
+    with _supabase_sync_lock:
+        try:
+            with _file_lock:
+                watchlists = _read_json_cached(USER_WATCHLIST_FILE, dict)
+                portfolios = _read_json_cached(USER_PORTFOLIO_FILE, dict)
+                alerts = _read_json_cached(USER_ALERT_FILE, dict)
+                owner_port = _read_json_cached(PORTFOLIO_FILE, dict)
+            owner_uid = str(DISCORD_OWNER_ID or owner_port.get("owner_id") or "").strip()
+            if owner_uid and owner_port.get("holdings"):
+                u_port = portfolios.get(owner_uid) or {}
+                if not u_port.get("holdings") or _parse_iso_ts(owner_port.get("updated_at")) >= _parse_iso_ts(u_port.get("updated_at")):
+                    portfolios = dict(portfolios)
+                    portfolios[owner_uid] = owner_port
+            all_uids = (set(watchlists.keys()) | set(portfolios.keys()) | set(alerts.keys())) - {"unit_test_user_888", "test_user_999", "friend_123"}
+            if not all_uids:
+                return True
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows = [
+                {
+                    "user_id": str(uid),
+                    "watchlist": watchlists.get(uid, []),
+                    "portfolio": portfolios.get(uid, {}),
+                    "alerts": alerts.get(uid, []),
+                    "updated_at": now_iso,
+                }
+                for uid in all_uids
+            ]
+            url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?on_conflict=user_id"
+            body = json.dumps(rows, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as e:
+            try:
+                e.close()
+            except Exception:
+                pass
+            print(f"⚠️ Supabase upsert warning: HTTP {e.code}", flush=True)
+            return False
+        except Exception as e:
+            print(f"⚠️ Supabase upsert warning: {type(e).__name__}", flush=True)
+            return False
 
 def restore_user_data_from_supabase() -> bool:
     """ดึงข้อมูลผู้ใช้ทุกคนจากตาราง user_profiles บน Supabase มาลงไฟล์แคชในเครื่องตอนเปิดบอท"""
     global _suppress_cloud_sync
-    if not _SUPABASE_ENABLED:
+    if not (_SUPABASE_ENABLED and _is_valid_supabase_config(SUPABASE_URL, SUPABASE_KEY, SUPABASE_TABLE)):
         return False
     try:
         url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?select=user_id,watchlist,portfolio,alerts"
@@ -241,40 +328,64 @@ def restore_user_data_from_supabase() -> bool:
         if not isinstance(rows, list) or not rows:
             return False
 
-        watchlists = _read_json_cached(USER_WATCHLIST_FILE, dict)
-        portfolios = _read_json_cached(USER_PORTFOLIO_FILE, dict)
-        alerts = _read_json_cached(USER_ALERT_FILE, dict)
-        watchlists.pop("unit_test_user_888", None)
-        portfolios.pop("unit_test_user_888", None)
-        alerts.pop("unit_test_user_888", None)
+        with _file_lock:
+            watchlists = _read_json_cached(USER_WATCHLIST_FILE, dict)
+            portfolios = _read_json_cached(USER_PORTFOLIO_FILE, dict)
+            alerts = _read_json_cached(USER_ALERT_FILE, dict)
+            local_owner_port = _read_json_cached(PORTFOLIO_FILE, dict)
+            watchlists.pop("unit_test_user_888", None)
+            portfolios.pop("unit_test_user_888", None)
+            alerts.pop("unit_test_user_888", None)
 
-        owner_portfolio = None
-        for r in rows:
-            uid = str(r.get("user_id") or "").strip()
-            if not uid or uid == "unit_test_user_888":
-                continue
-            if isinstance(r.get("watchlist"), list):
-                watchlists[uid] = r["watchlist"]
-            if isinstance(r.get("portfolio"), dict) and r["portfolio"]:
-                portfolios[uid] = r["portfolio"]
-                if (DISCORD_OWNER_ID and uid == str(DISCORD_OWNER_ID)) or str(r["portfolio"].get("owner_id", "")) == uid:
-                    owner_portfolio = r["portfolio"]
-            if isinstance(r.get("alerts"), list):
-                alerts[uid] = r["alerts"]
+            owner_portfolio = None
+            needs_cloud_push = False
+            for r in rows:
+                uid = str(r.get("user_id") or "").strip()
+                if not uid or uid == "unit_test_user_888":
+                    continue
+                if isinstance(r.get("watchlist"), list):
+                    watchlists[uid] = r["watchlist"]
+                if isinstance(r.get("portfolio"), dict) and r["portfolio"]:
+                    rem_p = r["portfolio"]
+                    loc_p = portfolios.get(uid) or {}
+                    is_owner_row = (DISCORD_OWNER_ID and uid == str(DISCORD_OWNER_ID)) or str(rem_p.get("owner_id", "")) == uid or str(local_owner_port.get("owner_id", "")) == uid
+                    if is_owner_row and local_owner_port.get("holdings"):
+                        if _parse_iso_ts(local_owner_port.get("updated_at")) > _parse_iso_ts(loc_p.get("updated_at")):
+                            loc_p = local_owner_port
+                    rem_ts = _parse_iso_ts(rem_p.get("updated_at"))
+                    loc_ts = _parse_iso_ts(loc_p.get("updated_at"))
+                    if loc_p.get("holdings") and loc_ts > 0 and (rem_ts == 0 or loc_ts > rem_ts):
+                        portfolios[uid] = loc_p
+                        needs_cloud_push = True
+                    else:
+                        portfolios[uid] = rem_p
+                    if is_owner_row:
+                        owner_portfolio = portfolios[uid]
+                if isinstance(r.get("alerts"), list):
+                    alerts[uid] = r["alerts"]
 
-        _suppress_cloud_sync = True
-        try:
-            _write_json_local_only(USER_WATCHLIST_FILE, watchlists)
-            _write_json_local_only(USER_PORTFOLIO_FILE, portfolios)
-            _write_json_local_only(USER_ALERT_FILE, alerts)
-            if owner_portfolio:
-                _write_json_local_only(PORTFOLIO_FILE, owner_portfolio)
-        finally:
-            _suppress_cloud_sync = False
+            _suppress_cloud_sync = True
+            try:
+                _write_json_local_only(USER_WATCHLIST_FILE, watchlists)
+                _write_json_local_only(USER_PORTFOLIO_FILE, portfolios)
+                _write_json_local_only(USER_ALERT_FILE, alerts)
+                if owner_portfolio:
+                    _write_json_local_only(PORTFOLIO_FILE, owner_portfolio)
+            finally:
+                _suppress_cloud_sync = False
+        if needs_cloud_push:
+            _supabase_upsert_all_users()
         print(f"☁️ กู้คืนข้อมูลผู้ใช้จาก Supabase สำเร็จ ({len(rows)} ผู้ใช้)", flush=True)
         return True
+    except urllib.error.HTTPError as e:
+        try:
+            e.close()
+        except Exception:
+            pass
+        print(f"⚠️ ดึงข้อมูลจาก Supabase ไม่สำเร็จ: HTTP {e.code}", flush=True)
+        return False
     except Exception as e:
-        print(f"⚠️ ดึงข้อมูลจาก Supabase ไม่สำเร็จ: {e}", flush=True)
+        print(f"⚠️ ดึงข้อมูลจาก Supabase ไม่สำเร็จ: {type(e).__name__}", flush=True)
         return False
 
 def _write_json_cached(filepath, data):
@@ -323,6 +434,9 @@ TICKER_ALIASES = {
 _RE_LEADING_SIGNS = re.compile(r'^[$#]+')
 _RE_PREFIX_TYPO = re.compile(r'^(ticker|ticket|sym|symbol|stock)\s*[:=]?\s*', re.IGNORECASE)
 _RE_CLASS_SHARE = re.compile(r'^[A-Za-z]{1,5}\.[A-Za-z]$')
+_RE_VALID_TICKER = re.compile(r'^(?!.*\.\.)(?=.*[A-Z0-9])[A-Z0-9^][A-Z0-9._\-=]{0,14}$')
+_MAX_PORTFOLIO_HOLDINGS = 50
+_MAX_WATCHLIST_SIZE = 50
 
 def clean_ticker(ticker_str: str) -> str:
     if not ticker_str:
@@ -333,7 +447,23 @@ def clean_ticker(ticker_str: str) -> str:
     if _RE_CLASS_SHARE.match(s):
         s = s.replace('.', '-')
     s_upper = s.upper().strip()
-    return TICKER_ALIASES.get(s_upper, s_upper)
+    s_upper = TICKER_ALIASES.get(s_upper, s_upper)
+    return s_upper if _RE_VALID_TICKER.match(s_upper) else ""
+
+def _is_valid_number(val, allow_zero: bool = False, max_val: float = 1e9) -> bool:
+    if isinstance(val, bool):
+        return False
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(num) or num > max_val:
+        return False
+    return num >= 0.0 if allow_zero else num > 0.0
+
+def _clean_category(category: str) -> str:
+    s = re.sub(r'[\r\n\t`*_<>@]+', ' ', str(category or "")).strip()
+    return s[:30] if s else "General"
 
 # In-memory Macro Cache (3 minutes TTL)
 _macro_cache = {
@@ -366,6 +496,7 @@ def get_cached_macro(ttl_seconds=180):
                 'spx': 5500.0,
                 'spx_ema50': 5400.0,
                 'spx_above_ema50': True,
+                'spx_ret_20d': 0.0,
                 'hurdle': 80,
                 'macro_score': 10
             }
@@ -401,90 +532,189 @@ def load_user_portfolios():
 
 def save_user_portfolios(data):
     _write_json_cached(USER_PORTFOLIO_FILE, data)
+    try:
+        p_data = load_portfolio_data() or {}
+        owner_uid = str(DISCORD_OWNER_ID or p_data.get("owner_id") or "").strip()
+        if owner_uid and owner_uid in data and owner_uid not in {"unit_test_user_888", "test_user_999", "friend_123"}:
+            owner_doc = dict(data[owner_uid])
+            owner_doc.setdefault("owner_id", owner_uid)
+            _write_json_local_only(PORTFOLIO_FILE, owner_doc)
+    except Exception:
+        pass
 
 def get_user_portfolio_data(user_id_str):
-    """ดึงข้อมูลพอร์ตของ User หากไม่มีและเป็นเจ้าของ ให้ fallback ไปที่ portfolio_holdings.json"""
+    """ดึงข้อมูลพอร์ตของ User หากไม่มีและเป็นเจ้าของ ให้ fallback ไปที่ portfolio_holdings.json (และใช้ฝั่งที่อัปเดตล่าสุดเสมอ)"""
     user_id_str = str(user_id_str) if user_id_str else ""
     portfolios = load_user_portfolios()
-    
-    if user_id_str and user_id_str in portfolios:
-        return portfolios[user_id_str]
-    
-    # ถ้าไม่มี user_id หรือเป็นเจ้าของ ให้ fallback ไปอ่าน portfolio_holdings.json
-    if not user_id_str or (DISCORD_OWNER_ID and user_id_str == str(DISCORD_OWNER_ID)):
-        return load_portfolio_data()
-    
     p_data = load_portfolio_data()
-    if p_data:
-        json_owner = p_data.get("owner_id") or p_data.get("discord_user_id")
-        if json_owner and str(user_id_str) == str(json_owner):
-            return p_data
+    json_owner = str((p_data or {}).get("owner_id") or (p_data or {}).get("discord_user_id") or "").strip()
+    is_owner = not user_id_str or (DISCORD_OWNER_ID and user_id_str == str(DISCORD_OWNER_ID)) or (json_owner and user_id_str == json_owner)
+
+    if user_id_str and user_id_str in portfolios:
+        u_port = portfolios[user_id_str]
+        if is_owner and p_data and p_data.get("holdings"):
+            if _parse_iso_ts(p_data.get("updated_at")) > _parse_iso_ts(u_port.get("updated_at")):
+                return p_data
+        return u_port
+
+    if is_owner:
+        return p_data
 
     return None
 
-def add_user_portfolio_holding(user_id_str, ticker, shares, avg_cost, category="General"):
+def add_user_portfolio_holding(user_id_str, ticker, shares, avg_cost, category="General", mode="set", spend_thb=0.0):
     user_id_str = str(user_id_str)
     ticker = clean_ticker(ticker)
-    portfolios = load_user_portfolios()
-    
-    user_port = portfolios.get(user_id_str)
-    if not user_port:
-        base = get_user_portfolio_data(user_id_str)
-        if base and "holdings" in base:
-            user_port = json.loads(json.dumps(base))
-        else:
-            user_port = {
-                "updated_at": datetime.datetime.now().isoformat(),
-                "source": "Dime! App Portfolio",
-                "holdings": {}
+    if not ticker or not _is_valid_number(shares) or not _is_valid_number(avg_cost, allow_zero=True):
+        return False
+    if not _is_valid_number(spend_thb, allow_zero=True):
+        spend_thb = 0.0
+    cat_input = _clean_category(category)
+
+    with _file_lock:
+        portfolios = load_user_portfolios()
+        user_port = portfolios.get(user_id_str)
+        if not user_port:
+            base = get_user_portfolio_data(user_id_str)
+            if base and "holdings" in base:
+                user_port = json.loads(json.dumps(base))
+            else:
+                user_port = {
+                    "updated_at": datetime.datetime.now().isoformat(),
+                    "source": "Dime! App Portfolio",
+                    "holdings": {}
+                }
+
+        if "holdings" not in user_port:
+            user_port["holdings"] = {}
+
+        if ticker not in user_port["holdings"] and len(user_port["holdings"]) >= _MAX_PORTFOLIO_HOLDINGS:
+            return False
+
+        existing = user_port["holdings"].get(ticker, {})
+        add_shares = float(shares)
+        buy_price = float(avg_cost)
+        cat_val = cat_input if cat_input != "General" else _clean_category(existing.get("category", "General"))
+
+        if mode == "buy" and existing:
+            old_sh = float(existing.get("shares", 0))
+            old_avg = float(existing.get("avg_cost_usd", 0))
+            old_cost = float(existing.get("total_cost_usd", round(old_sh * old_avg, 2)))
+            add_cost = round(add_shares * buy_price, 2)
+            new_sh = round(old_sh + add_shares, 7)
+            new_cost = round(old_cost + add_cost, 2)
+            new_avg = round((old_sh * old_avg + add_shares * buy_price) / new_sh, 4) if new_sh > 0 else buy_price
+            user_port["holdings"][ticker] = {
+                **existing,
+                "shares": new_sh,
+                "avg_cost_usd": new_avg,
+                "total_cost_usd": new_cost,
+                "category": cat_val,
             }
-    
-    if "holdings" not in user_port:
-        user_port["holdings"] = {}
-        
-    user_port["updated_at"] = datetime.datetime.now().isoformat()
-    user_port["holdings"][ticker] = {
-        "shares": float(shares),
-        "avg_cost_usd": float(avg_cost),
-        "total_cost_usd": round(float(shares) * float(avg_cost), 2),
-        "category": str(category) if category else "General"
-    }
-    portfolios[user_id_str] = user_port
-    save_user_portfolios(portfolios)
-    return True
+            summary = dict(user_port.get("portfolio_summary") or {})
+            fx_r = float(summary.get("fx_rate_thb") or 33.67)
+            deduct_thb = float(spend_thb) if spend_thb > 0 else round(add_cost * fx_r, 2)
+            if "cash_thb" in summary:
+                summary["cash_thb"] = round(max(0.0, float(summary["cash_thb"]) - deduct_thb), 2)
+                user_port["portfolio_summary"] = summary
+        else:
+            user_port["holdings"][ticker] = {
+                **existing,
+                "shares": round(add_shares, 7),
+                "avg_cost_usd": round(buy_price, 4),
+                "total_cost_usd": round(add_shares * buy_price, 2),
+                "category": cat_val,
+            }
+
+        user_port["updated_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+        portfolios[user_id_str] = user_port
+        save_user_portfolios(portfolios)
+        return True
 
 def remove_user_portfolio_holding(user_id_str, ticker):
     user_id_str = str(user_id_str)
     ticker = clean_ticker(ticker)
-    portfolios = load_user_portfolios()
-    
-    user_port = portfolios.get(user_id_str)
-    if not user_port:
-        base = get_user_portfolio_data(user_id_str)
-        if base and "holdings" in base:
-            user_port = json.loads(json.dumps(base))
-        else:
-            return False
-            
-    holdings = user_port.get("holdings", {})
-    if ticker in holdings:
-        del holdings[ticker]
-        user_port["updated_at"] = datetime.datetime.now().isoformat()
-        portfolios[user_id_str] = user_port
-        save_user_portfolios(portfolios)
-        return True
-    return False
+    if not ticker:
+        return False
+    with _file_lock:
+        portfolios = load_user_portfolios()
+
+        user_port = portfolios.get(user_id_str)
+        if not user_port:
+            base = get_user_portfolio_data(user_id_str)
+            if base and "holdings" in base:
+                user_port = json.loads(json.dumps(base))
+            else:
+                return False
+
+        holdings = user_port.get("holdings", {})
+        if ticker in holdings:
+            del holdings[ticker]
+            # คำนวณยอดรวมใหม่จากหุ้นที่เหลือ เพื่อไม่ให้ summary ค้างค่าเดิม
+            summary = user_port.get("portfolio_summary")
+            if isinstance(summary, dict):
+                t_cost = sum(float(h.get("total_cost_usd", float(h.get("shares", 0)) * float(h.get("avg_cost_usd", 0)))) for h in holdings.values())
+                t_val = sum(float(h.get("current_value_usd", 0)) for h in holdings.values())
+                fx_r = float(summary.get("fx_rate_thb") or 33.67)
+                summary.update({
+                    "total_assets": len(holdings),
+                    "total_cost_usd": round(t_cost, 2),
+                    "total_value_usd": round(t_val, 2),
+                    "total_value_thb": round(t_val * fx_r, 2),
+                    "total_pnl_usd": round(t_val - t_cost, 2),
+                    "total_pnl_pct": round((t_val - t_cost) / t_cost * 100, 2) if t_cost > 0 else 0.0,
+                })
+            user_port["updated_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+            portfolios[user_id_str] = user_port
+            save_user_portfolios(portfolios)
+            return True
+        return False
 
 def clear_user_portfolio(user_id_str):
     user_id_str = str(user_id_str)
-    portfolios = load_user_portfolios()
-    portfolios[user_id_str] = {
-        "updated_at": datetime.datetime.now().isoformat(),
-        "source": "Dime! App Portfolio",
-        "holdings": {}
-    }
-    save_user_portfolios(portfolios)
-    return True
+    with _file_lock:
+        portfolios = load_user_portfolios()
+        portfolios[user_id_str] = {
+            "updated_at": datetime.datetime.now().isoformat(),
+            "source": "Dime! App Portfolio",
+            "holdings": {}
+        }
+        save_user_portfolios(portfolios)
+        return True
+
+def set_user_portfolio_cash(user_id_str, amount_thb: float, mode: str = "set") -> tuple[bool, float]:
+    """อัปเดตยอดเงินสดคงเหลือในพอร์ต (THB): mode='set' ตั้งยอดใหม่, 'add' เติมเงิน, 'sub' ถอน/หักเงิน"""
+    user_id_str = str(user_id_str)
+    if mode not in ("set", "add", "sub"):
+        return False, 0.0
+    if not _is_valid_number(amount_thb, allow_zero=(mode == "set"), max_val=1e9):
+        return False, 0.0
+    with _file_lock:
+        portfolios = load_user_portfolios()
+        user_port = portfolios.get(user_id_str)
+        if not user_port:
+            user_port = {
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "source": "Dime! App Portfolio",
+                "holdings": {},
+                "portfolio_summary": {},
+            }
+        summary = dict(user_port.get("portfolio_summary") or {})
+        curr_cash = float(summary.get("cash_thb") or 0.0)
+        if mode == "set":
+            new_cash = round(float(amount_thb), 2)
+        elif mode == "add":
+            new_cash = round(curr_cash + float(amount_thb), 2)
+        else:
+            new_cash = round(max(0.0, curr_cash - float(amount_thb)), 2)
+        if not _is_valid_number(new_cash, allow_zero=True, max_val=1e9):
+            return False, curr_cash
+        summary["cash_thb"] = new_cash
+        user_port["portfolio_summary"] = summary
+        user_port["updated_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+        portfolios[user_id_str] = user_port
+        save_user_portfolios(portfolios)
+        return True, new_cash
 
 async def is_portfolio_owner(user) -> bool:
     """ตรวจสอบว่าเป็นเจ้าของพอร์ตหรือไม่"""
@@ -545,34 +775,38 @@ def build_portfolio_embed(user_id=None, user_name="", refresh_live_prices=True):
     fetched_map = {}
     if refresh_live_prices and symbols:
         try:
-            fetched_items = list(_executor.map(fetch_ticker_data, symbols))
+            fetched_items = list(_fetch_executor.map(fetch_ticker_data, symbols))
             for s, item in zip(symbols, fetched_items):
                 if item:
                     fetched_map[s] = item
         except Exception as e:
             print(f"Error fetching live prices for portfolio: {e}")
 
-    total_cost = 0.0
+    total_cost_exact = 0.0
+    total_cost_sum = 0.0
     total_value = 0.0
     updated_holdings = []
 
     for sym, h in holdings.items():
         shares = float(h.get("shares", 0))
         avg_cost = float(h.get("avg_cost_usd", 0))
-        cost = float(h.get("total_cost_usd", shares * avg_cost))
+        cost = float(h.get("total_cost_usd", round(shares * avg_cost, 2)))
         category = h.get("category", "General")
 
+        fallback_p = float(h.get("current_price_usd") or avg_cost)
+        curr_price = fallback_p if not math.isnan(fallback_p) else avg_cost
         live_item = fetched_map.get(sym)
         if live_item and live_item.get('tech'):
-            curr_price = float(live_item['tech'].get('price', h.get("current_price_usd", avg_cost)))
-        else:
-            curr_price = float(h.get("current_price_usd", avg_cost))
+            p_cand = float(live_item['tech'].get('price', 0))
+            if not math.isnan(p_cand) and p_cand > 0:
+                curr_price = p_cand
 
-        curr_val = shares * curr_price
-        pnl_val = curr_val - cost
+        curr_val = round(shares * curr_price, 2)
+        pnl_val = round(curr_val - cost, 2)
         pnl_pct = (pnl_val / cost * 100) if cost > 0 else 0.0
 
-        total_cost += cost
+        total_cost_exact += shares * avg_cost
+        total_cost_sum += cost
         total_value += curr_val
 
         updated_holdings.append({
@@ -587,12 +821,51 @@ def build_portfolio_embed(user_id=None, user_name="", refresh_live_prices=True):
             "category": category
         })
 
-    total_pnl = total_value - total_cost
+    total_cost = round(total_cost_exact, 2) if total_cost_exact > 0 else round(total_cost_sum, 2)
+    total_value = round(total_value, 2)
+    total_pnl = round(total_value - total_cost, 2)
     total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
     updated_holdings.sort(key=lambda x: x["curr_val"], reverse=True)
     for item in updated_holdings:
         item["weight_pct"] = (item["curr_val"] / total_value * 100) if total_value > 0 else 0.0
+
+    if refresh_live_prices and fetched_map and str(user_id or "") not in {"unit_test_user_888", "test_user_999", "friend_123"}:
+        try:
+            with _file_lock:
+                for item in updated_holdings:
+                    sym = item["ticker"]
+                    if sym in holdings:
+                        holdings[sym]["current_price_usd"] = round(item["curr_price"], 2)
+                        holdings[sym]["current_value_usd"] = item["curr_val"]
+                        holdings[sym]["pnl_usd"] = item["pnl_val"]
+                        holdings[sym]["pnl_pct"] = round(item["pnl_pct"], 2)
+                        holdings[sym]["weight_pct"] = round(item["weight_pct"], 2)
+                fx_r = float(summary.get("fx_rate_thb") or 33.67)
+                if _macro_cache.get('data') and _macro_cache['data'].get('fx_thb'):
+                    fx_r = float(_macro_cache['data']['fx_thb'])
+                summary.update({
+                    "fx_rate_thb": fx_r,
+                    "total_assets": len(updated_holdings),
+                    "total_cost_usd": total_cost,
+                    "total_value_usd": total_value,
+                    "total_value_thb": round(total_value * fx_r, 2),
+                    "total_pnl_usd": total_pnl,
+                    "total_pnl_pct": round(total_pnl_pct, 2),
+                })
+                data["portfolio_summary"] = summary
+                data["price_updated_at"] = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+                owner_uid = str(DISCORD_OWNER_ID or data.get("owner_id") or "").strip()
+                if not user_id or str(user_id) == owner_uid:
+                    _write_json_local_only(PORTFOLIO_FILE, data)
+                target_save_uid = str(user_id or owner_uid).strip()
+                if target_save_uid:
+                    u_ports = load_user_portfolios()
+                    if target_save_uid in u_ports or target_save_uid == owner_uid:
+                        u_ports[target_save_uid] = data
+                        _write_json_local_only(USER_PORTFOLIO_FILE, u_ports)
+        except Exception:
+            pass
 
     color = 0x2ECC71 if total_pnl >= 0 else 0xE74C3C
     pnl_sign = "+" if total_pnl >= 0 else ""
@@ -639,9 +912,13 @@ def build_portfolio_embed(user_id=None, user_name="", refresh_live_prices=True):
         sym = item["ticker"]
         sign = "+" if item["pnl_val"] >= 0 else ""
         sym_emoji = "🟢" if item["pnl_val"] >= 0 else "🔴"
+        avg_c = item["avg_cost"]
+        avg_c_str = f"{avg_c:.4f}".rstrip("0").rstrip(".")
+        if "." not in avg_c_str or len(avg_c_str.split(".")[1]) < 2:
+            avg_c_str = f"{avg_c:.2f}"
         lines.append(
-            f"{sym_emoji} **`{sym:<5}`** | `${item['curr_price']:.2f}` (ทุน `${item['avg_cost']:.2f}`) | "
-            f"**{sign}{item['pnl_pct']:.2f}%** ({sign}${item['pnl_val']:.2f}) | น้ำหนัก {item['weight_pct']:.1f}%"
+            f"{sym_emoji} **`{sym:<5}`** | `${item['curr_price']:.2f}` | ทุนรวม `${item['cost']:.2f}` (ทุน/หุ้น `${avg_c_str}`) | "
+            f"**{sign}{item['pnl_pct']:.2f}%** ({sign}${item['pnl_val']:.2f}) | พอร์ต {item['weight_pct']:.1f}%"
         )
 
     embed.add_field(
@@ -649,6 +926,32 @@ def build_portfolio_embed(user_id=None, user_name="", refresh_live_prices=True):
         value="\n".join(lines[:15]) if lines else "ไม่มีรายการ",
         inline=False
     )
+
+    # DCA Simulator for holdings in drawdown
+    cash_thb = float(summary.get("cash_thb") or 0.0)
+    fx_disp = float(summary.get("fx_rate_thb") or 33.67)
+    red_items = [it for it in updated_holdings if it["pnl_pct"] < -1.0 and it["curr_price"] > 0]
+    if cash_thb >= 50 and red_items:
+        red_items.sort(key=lambda x: x["pnl_pct"])
+        tranche_thb = cash_thb if cash_thb <= 1500 else round(cash_thb * 0.40, -1)
+        buy_usd = round(tranche_thb / fx_disp, 2)
+        sim_strs = []
+        for it in red_items[:3]:
+            add_sh = buy_usd / it["curr_price"]
+            new_sh = it["shares"] + add_sh
+            new_cost = it["cost"] + buy_usd
+            new_avg = new_cost / new_sh if new_sh > 0 else it["avg_cost"]
+            new_val = new_sh * it["curr_price"]
+            new_pct = ((new_val - new_cost) / new_cost * 100) if new_cost > 0 else 0.0
+            sim_strs.append(
+                f"• **`{it['ticker']:<5}`** (@ `${it['curr_price']:.2f}`): ได้ `+{add_sh:.5f}` หุ้น | "
+                f"ทุน `${it['avg_cost']:.2f}` ➔ **`${new_avg:.2f}`** (`{it['pnl_pct']:.2f}%` ➔ **`{new_pct:.2f}%`**)"
+            )
+        embed.add_field(
+            name=f"🧮 จำลองผลหลังถัวเฉลี่ย (งบ {tranche_thb:,.0f} THB ≈ ${buy_usd:.2f})",
+            value="\n".join(sim_strs),
+            inline=False
+        )
 
     embed.set_footer(text="Dime! App Portfolio • ข้อมูลเพื่อประกอบการตัดสินใจส่วนบุคคล")
     return embed
@@ -663,8 +966,9 @@ def save_user_alerts(data):
 
 def add_user_alert(user_id_str, channel_id, ticker, target_price, current_price=None):
     ticker = clean_ticker(ticker)
-    if not ticker or target_price <= 0:
+    if not ticker or not _is_valid_number(target_price):
         return False, "⚠️ ชื่อหุ้นหรือราคาเป้าหมายไม่ถูกต้อง"
+    target_price = float(target_price)
 
     if current_price is None:
         cached_p = get_cached_price(ticker)
@@ -676,50 +980,56 @@ def add_user_alert(user_id_str, channel_id, ticker, target_price, current_price=
                 current_price = data['tech'].get('price', target_price)
             else:
                 current_price = target_price
+    if not _is_valid_number(current_price):
+        current_price = target_price
 
     condition = "gte" if target_price >= current_price else "lte"
     cond_desc = f"ขึ้นแตะหรือทะลุ ${target_price:.2f}" if condition == "gte" else f"ย่อลงแตะหรือต่ำกว่า ${target_price:.2f}"
 
-    alerts = load_user_alerts()
-    user_list = alerts.get(str(user_id_str), [])
+    with _file_lock:
+        alerts = load_user_alerts()
+        user_list = alerts.get(str(user_id_str), [])
 
-    if len(user_list) >= 20:
-        return False, "⚠️ คุณมีรายการแจ้งเตือนครบโควตา 20 รายการแล้ว กรุณาลบรายการเก่าออกก่อน"
+        if len(user_list) >= 20:
+            return False, "⚠️ คุณมีรายการแจ้งเตือนครบโควตา 20 รายการแล้ว กรุณาลบรายการเก่าออกก่อน"
 
-    alert_id = f"{ticker}_{target_price:.2f}_{condition}"
-    for a in user_list:
-        if a.get('symbol') == ticker and abs(a.get('target_price', 0) - target_price) < 0.001 and not a.get('triggered', False):
-            return False, f"ℹ️ มีรายการแจ้งเตือน `{ticker}` ที่ราคา `${target_price:.2f}` อยู่แล้ว"
+        alert_id = f"{ticker}_{target_price:.2f}_{condition}"
+        for a in user_list:
+            if a.get('symbol') == ticker and abs(a.get('target_price', 0) - target_price) < 0.001 and not a.get('triggered', False):
+                return False, f"ℹ️ มีรายการแจ้งเตือน `{ticker}` ที่ราคา `${target_price:.2f}` อยู่แล้ว"
 
-    new_alert = {
-        "id": alert_id,
-        "symbol": ticker,
-        "target_price": round(float(target_price), 2),
-        "condition": condition,
-        "channel_id": int(channel_id) if channel_id else None,
-        "created_at": datetime.datetime.now().isoformat(),
-        "initial_price": round(float(current_price), 2),
-        "triggered": False
-    }
-    user_list.append(new_alert)
-    alerts[str(user_id_str)] = user_list
-    save_user_alerts(alerts)
+        new_alert = {
+            "id": alert_id,
+            "symbol": ticker,
+            "target_price": round(float(target_price), 2),
+            "condition": condition,
+            "channel_id": int(channel_id) if channel_id else None,
+            "created_at": datetime.datetime.now().isoformat(),
+            "initial_price": round(float(current_price), 2),
+            "triggered": False
+        }
+        user_list.append(new_alert)
+        alerts[str(user_id_str)] = user_list
+        save_user_alerts(alerts)
     return True, f"✅ ตั้งแจ้งเตือน `{ticker}` เมื่อราคา{cond_desc} สำเร็จ! (ราคาปัจจุบัน: `${current_price:.2f}`)"
 
 def remove_user_alert(user_id_str, ticker_or_id):
-    ticker_or_id = ticker_or_id.strip()
-    alerts = load_user_alerts()
-    user_list = alerts.get(str(user_id_str), [])
-    if not user_list:
+    ticker_or_id = str(ticker_or_id or "").strip()
+    if not ticker_or_id:
         return 0
-    clean_sym = clean_ticker(ticker_or_id)
-    rem = [a for a in user_list if a.get('id') == ticker_or_id or a.get('symbol') == clean_sym]
-    if not rem:
-        return 0
-    new_list = [a for a in user_list if a not in rem]
-    alerts[str(user_id_str)] = new_list
-    save_user_alerts(alerts)
-    return len(rem)
+    with _file_lock:
+        alerts = load_user_alerts()
+        user_list = alerts.get(str(user_id_str), [])
+        if not user_list:
+            return 0
+        clean_sym = clean_ticker(ticker_or_id)
+        rem = [a for a in user_list if a.get('id') == ticker_or_id or (clean_sym and a.get('symbol') == clean_sym)]
+        if not rem:
+            return 0
+        new_list = [a for a in user_list if a not in rem]
+        alerts[str(user_id_str)] = new_list
+        save_user_alerts(alerts)
+        return len(rem)
 
 def build_alerts_embed(user_name, user_id_str):
     alerts = load_user_alerts()
@@ -951,9 +1261,9 @@ def fetch_ticker_data(ticker_sym, force_refresh=False, ttl_seconds=180):
             return None
         tech = calculate_technical(hist)
 
-        # Keep only recent compact OHLCV float32 slice (35 rows) to drastically cut RAM
+        # Keep compact 1-year OHLCV float32 slice (252 rows, ~5 KB) for accurate /history 3mo/6mo/1y returns
         cols = [c for c in ('Open', 'High', 'Low', 'Close', 'Volume') if c in hist.columns]
-        compact_hist = hist[cols].tail(35).astype('float32')
+        compact_hist = hist[cols].tail(252).astype('float32')
 
         fund_val = None
         with _ticker_cache_lock:
@@ -995,90 +1305,29 @@ def fetch_ticker_data(ticker_sym, force_refresh=False, ttl_seconds=180):
         print(f"Error fetching {ticker_sym}: {e}")
         return None
 
-# Helper: Quantitative Entry Zone Calculator (Pullback Sweetspot, Multi-Tier Support & Stop Loss)
-def compute_entry_zone(tech):
-    price = tech.get('price', 0)
-    ema20 = tech.get('ema20', price)
-    ema50 = tech.get('ema50', price)
-    ema200 = tech.get('ema200', price)
-    ema_dist = tech.get('ema_dist', 0)
-    
-    if -2.0 <= ema_dist <= 2.5:
-        # Tier 1: In Sweetspot (near EMA20)
-        buy_low = ema20 * 0.985
-        buy_high = ema20 * 1.02
-        stop_loss = ema50 * 0.97
-        zone_type = "ใกล้เส้น EMA20"
-        entry_status = "🟢 อยู่ในโซนซื้อเหมาะสม (In Sweetspot)"
-        entry_advice = "ราคาอยู่ในโซนย่อตัวที่ได้เปรียบต้นทุน เข้าซื้อสะสมได้ทันที"
-        playbook_note = "จังหวะย่อตัวปกติในแนวโน้มขาขึ้น ทยอยสะสมตามแผนได้"
-        buy_zone_str = f"${buy_low:.2f} - ${buy_high:.2f}"
-    elif ema_dist > 2.5:
-        # Tier 1: Extended
-        buy_low = ema20 * 0.985
-        buy_high = ema20 * 1.02
-        stop_loss = ema50 * 0.97
-        zone_type = "เป้าหมายย่อตัว EMA20"
-        entry_status = f"🟡 วิ่งเกินจุดซื้อ (+{ema_dist:.1f}%) รอจังหวะย่อ"
-        entry_advice = f"ราคาไล่ขึ้นสูง แนะนำรอราคาย่อตัวกลับมาที่ ${buy_low:.2f} - ${buy_high:.2f}"
-        playbook_note = "ราคาขึ้นมาไกล ไม่ควรไล่ราคา รอให้ย่อตัวกลับเข้าหากรอบ EMA20"
-        buy_zone_str = f"${buy_low:.2f} - ${buy_high:.2f}"
-    else:
-        # Deep Pullback / Breakdown (ema_dist < -2.0%)
-        if price >= ema50 * 0.97:
-            # Tier 2: Testing EMA50 Intermediate Support
-            buy_low = ema50 * 0.985
-            buy_high = ema50 * 1.015
-            stop_loss = ema50 * 0.95
-            zone_type = "แนวรับ EMA50"
-            entry_status = f"🟠 พักฐานลึก ({ema_dist:.1f}%) รอตั้งรับ EMA50"
-            entry_advice = f"ราคาหลุด EMA20 กลายเป็นแนวต้าน แนะนำชะลอซื้อและรอดูแรงรับที่โซน EMA50 (${buy_low:.2f} - ${buy_high:.2f})"
-            playbook_note = "[ถือต่อ] มีของห้ามตกใจขาย | [ช้อนซื้อ] รอราคายืน EMA50 ได้แล้วแบ่งไม้ซื้อ | [พัก] ถือเงินสดรอความนิ่ง"
-            buy_zone_str = f"${buy_low:.2f} - ${buy_high:.2f}"
-        elif ema200 and ema200 > 0 and price >= ema200 * 0.97:
-            # Tier 3: Testing EMA200 Long-term Support
-            buy_low = ema200 * 0.985
-            buy_high = ema200 * 1.015
-            stop_loss = ema200 * 0.95
-            zone_type = "แนวรับใหญ่ EMA200"
-            entry_status = f"🔴 หลุดแนวรับ EMA50 ({ema_dist:.1f}%) รอรับ EMA200"
-            entry_advice = f"ราคาหลุดทั้ง EMA20 และ EMA50 แนวโน้มระยะกลางเสียทรง แนะนำชะลอซื้อ รอดูแรงรับที่แนวรับใหญ่ EMA200 (${buy_low:.2f} - ${buy_high:.2f})"
-            playbook_note = "[ถือต่อ] หุ้น Core ระยะยาวถือได้ | [ช้อนซื้อ] ชะลอรับมีด รอสร้างฐานที่ EMA200 | [พัก] ถือเงินสดปลอดภัยสุด"
-            buy_zone_str = f"${buy_low:.2f} - ${buy_high:.2f}"
-        else:
-            # Tier 4: Major breakdown below EMA200
-            buy_low = price * 0.92
-            buy_high = price * 0.96
-            stop_loss = price * 0.88
-            zone_type = "ชะลอซื้อ รอสร้างฐาน"
-            entry_status = "🔴 เสียทรงขาลง (Breakdown)"
-            entry_advice = "ราคาหลุดแนวรับสำคัญทุกเส้น แนะนำพักการลงทุน (Wait) รอราคาหยุดลงและสร้างฐานใหม่"
-            playbook_note = "พักการเข้าซื้อทันที ห้ามรับมีด ถือเงินสดรอดูสถานการณ์"
-            buy_zone_str = "ชะลอซื้อ (รอฐาน)"
-
-    # BSL Sweep Trap Warning Override
-    if tech.get('bsl_sweep'):
-        entry_status = "⚠️ ระวังติดดอย (เกิด BSL Sweep ชนยอดดอย ห้ามไล่ราคา)"
-        entry_advice = "ตรวจพบแรงเทขายกดทับหลังแทงทะลุ High 5 วัน (Liquidity Sweep) เสี่ยงพักฐานทันที ห้ามไล่ราคาเด็ดขาด"
-        
-    return {
-        'buy_low': buy_low,
-        'buy_high': buy_high,
-        'stop_loss': stop_loss,
-        'zone_type': zone_type,
-        'entry_status': entry_status,
-        'entry_advice': entry_advice,
-        'playbook_note': playbook_note,
-        'buy_zone_str': buy_zone_str
-    }
+def _compute_user_semi_exposure(user_id=None) -> float | None:
+    try:
+        p_data = get_user_portfolio_data(user_id) if user_id else load_portfolio_data()
+        holdings = (p_data or {}).get("holdings") or {}
+        if not holdings:
+            return None
+        tot_v = sum(float(h.get("current_value_usd", 0)) for h in holdings.values())
+        if tot_v <= 0:
+            return None
+        semi_v = sum(float(h.get("current_value_usd", 0)) for s, h in holdings.items() if s in SEMI_TICKERS)
+        return semi_v / tot_v
+    except Exception:
+        return None
 
 # Core Quant Evaluator (All-Around US Equities)
-def evaluate_stock(data_dict, macro, user_symbols=None):
+def evaluate_stock(data_dict, macro, user_symbols=None, semi_exposure=None):
     ticker_sym = data_dict['ticker']
-    tech = data_dict['tech']
+    tech = apply_relative_strength(dict(data_dict['tech']), macro)
     fund_val = data_dict['fund_val']
     
     portfolio_fit = fund_val['portfolio_fit']
+    if semi_exposure is not None and semi_exposure >= TRUE_SEMI_CAP and ticker_sym in SEMI_TICKERS:
+        portfolio_fit = 1
     sector_display = fund_val['sector_display']
     entry_info = compute_entry_zone(tech)
     
@@ -1091,33 +1340,9 @@ def evaluate_stock(data_dict, macro, user_symbols=None):
         portfolio_fit
     )
     
-    hurdle = macro['hurdle']
-    if total_score >= hurdle:
-        raw_action = "BUY"
-    elif total_score >= 65:
-        raw_action = "HOLD"
-    else:
-        raw_action = "WAIT"
-
-    final_action = raw_action
-    override_applied = False
-    override_reason = ""
-    if tech.get('bsl_sweep', False) and raw_action == "BUY":
-        final_action = "WAIT"
-        override_applied = True
-        override_reason = "เกิด BSL Sweep (ติดกับดักราคายอดดอย ห้ามไล่ราคา)"
-    elif tech.get('ema_dist', 0) > 8.0 and raw_action == "BUY":
-        final_action = "WAIT"
-        override_applied = True
-        override_reason = f"ราคาฉีกห่าง EMA20 เกิน +{tech.get('ema_dist', 0):.1f}% (เสี่ยงไล่ราคาดอย)"
-    elif tech.get('rsi', 0) >= 70 and raw_action == "BUY":
-        final_action = "HOLD"
-        override_applied = True
-        override_reason = f"RSI Overbought ({tech.get('rsi', 0):.1f} >= 70 เสี่ยงย่อพักฐาน)"
-    elif tech.get('price', 0) < tech.get('ema50', 0) and tech.get('price', 0) < tech.get('ema200', 0) and raw_action == "BUY":
-        final_action = "WAIT"
-        override_applied = True
-        override_reason = "แนวโน้มขาลง (ราคาหลุดต่ำกว่าทั้ง EMA50 และ EMA200)"
+    hurdle, raw_action, final_action, override_applied, override_reason = decide_action(
+        ticker_sym, total_score, tech, fund_val, macro, bool(fund_val.get('is_etf')), semi_exposure=semi_exposure
+    )
         
     return {
         'ticker': ticker_sym,
@@ -1125,6 +1350,7 @@ def evaluate_stock(data_dict, macro, user_symbols=None):
         'rsi': tech.get('rsi', 0),
         'ema_dist': tech.get('ema_dist', 0),
         'score': total_score,
+        'hurdle': hurdle,
         'raw_action': raw_action,
         'final_action': final_action,
         'override': override_applied,
@@ -1141,7 +1367,7 @@ def evaluate_stock(data_dict, macro, user_symbols=None):
 
 # ==================== EMBED BUILDERS ====================
 
-def build_scan_embed(symbols, user_name=""):
+def build_scan_embed(symbols, user_name="", user_id=None):
     if not symbols:
         embed = discord.Embed(
             title=f"⚠️ Watchlist ว่างเปล่า: {user_name}",
@@ -1157,14 +1383,15 @@ def build_scan_embed(symbols, user_name=""):
         embed.set_footer(text="Watchlist ถูกแยกเก็บเป็นรายบุคคลตาม Discord User ID")
         return embed
 
-    macro_fut = _executor.submit(get_cached_macro)
-    fetched_items = list(_executor.map(fetch_ticker_data, symbols))
+    macro_fut = _fetch_executor.submit(get_cached_macro)
+    fetched_items = list(_fetch_executor.map(fetch_ticker_data, symbols))
     macro = macro_fut.result()
+    semi_exp = _compute_user_semi_exposure(user_id)
     results = []
         
     for item in fetched_items:
         if item is not None:
-            evaluated = evaluate_stock(item, macro)
+            evaluated = evaluate_stock(item, macro, semi_exposure=semi_exp)
             results.append(evaluated)
             
     results.sort(key=lambda x: x['score'], reverse=True)
@@ -1276,10 +1503,17 @@ def build_scan_embed(symbols, user_name=""):
     embed.set_footer(text="ประเมินตามเกณฑ์ปัจจัยพื้นฐานและเทคนิค • แนะนำราคาเข้าซื้อตามแนวรับย่อตัว (EMA20/50/200)")
     return embed
 
-def build_check_embed(ticker_sym):
+def build_check_embed(ticker_sym, user_id=None):
     ticker_sym = clean_ticker(ticker_sym)
-    data_fut = _executor.submit(fetch_ticker_data, ticker_sym)
-    macro_fut = _executor.submit(get_cached_macro)
+    if not ticker_sym:
+        embed = discord.Embed(
+            title="❌ ชื่อหุ้นไม่ถูกต้อง",
+            description="กรุณาระบุชื่อย่อหุ้นที่ถูกต้อง เช่น `NVDA`, `AAPL`, `VOO`",
+            color=0xE74C3C
+        )
+        return embed, None
+    data_fut = _fetch_executor.submit(fetch_ticker_data, ticker_sym)
+    macro_fut = _fetch_executor.submit(get_cached_macro)
     data_dict = data_fut.result()
     if not data_dict:
         embed = discord.Embed(
@@ -1290,13 +1524,15 @@ def build_check_embed(ticker_sym):
         return embed, None
         
     macro = macro_fut.result()
-    ev = evaluate_stock(data_dict, macro)
+    semi_exp = _compute_user_semi_exposure(user_id)
+    ev = evaluate_stock(data_dict, macro, semi_exposure=semi_exp)
     
     fund_val = ev['fund_val']
     tech = ev['tech']
     total_score = ev['score']
-    hurdle = macro['hurdle']
+    hurdle = ev.get('hurdle', macro['hurdle'])
     action = ev['final_action']
+    override_note = f"\n⚠️ **กฎคุมความเสี่ยง:** `{ev['override_reason']}` (ลดจาก {ev['raw_action']} ➔ {action})" if ev.get('override') and ev.get('override_reason') else ""
     
     if action == "BUY":
         color = 0x2ECC71
@@ -1314,7 +1550,7 @@ def build_check_embed(ticker_sym):
     embed = discord.Embed(
         title=f"📊 ผลการประเมินหุ้น: {ticker_sym}",
         description=(
-            f"คำแนะนำ: {action_emoji} **{action}**\n"
+            f"คำแนะนำ: {action_emoji} **{action}**{override_note}\n"
             f"`[{progress_bar}]` **{total_score}/100** (เกณฑ์ซื้อ: {hurdle} คะแนน)\n"
             f"🎯 **ราคาควรเข้าซื้อ:** `{ent['buy_zone_str']}`"
         ),
@@ -1322,13 +1558,19 @@ def build_check_embed(ticker_sym):
     )
     
     # Highlight Target Buy Zone & Stop Loss
+    rr_txt = f" (R:R `{ent['rr_ratio']:.1f}:1`)" if ent.get('rr_ratio') else ""
+    atr_note = f" (1.5x ATR ${ent['atr']:.2f})" if ent.get('atr') else ""
+    target_line = f"\n• **เป้าหมายกำไร (Target):** `${ent['target_price']:.2f}`{rr_txt}" if ent.get('target_price') else ""
+    trail_line = f"\n• 🛡️ **Trailing Stop (ล็อกกำไร 2.5x ATR):** `${ent['chandelier_stop']:.2f}`" if ent.get('chandelier_stop', 0) > 0 and tech.get('price', 0) > ent.get('chandelier_stop', 0) else ""
+    fvg_z = ent.get('fvg_zone')
+    fvg_line = f"\n• 🧲 **โซน FVG สถาบันรับของ:** `${fvg_z[0]:.2f} - ${fvg_z[1]:.2f}`" if fvg_z else ""
     embed.add_field(
         name="🎯 โซนราคาที่ควรเข้าซื้อ & จุดตัดขาดทุน (Target Buy Zone)",
         value=(
-            f"• **กรอบราคาเข้าซื้อ:** `{ent['buy_zone_str']}` ({ent.get('zone_type', 'ใกล้เส้น EMA20')})\n"
+            f"• **กรอบราคาเข้าซื้อ:** `{ent['buy_zone_str']}` ({ent.get('zone_type', 'ใกล้เส้น EMA20')}){fvg_line}\n"
             f"• **สถานะปัจจุบัน:** {ent['entry_status']}\n"
             f"• **คำแนะนำจังหวะ:** {ent['entry_advice']}\n"
-            f"• **จุดตัดขาดทุนแนะนำ (Stop Loss):** `${ent['stop_loss']:.2f}`\n"
+            f"• **จุดตัดขาดทุนแนะนำ (Stop Loss):** `${ent['stop_loss']:.2f}`{atr_note}{target_line}{trail_line}\n"
             f"• **กลยุทธ์ตามสภาวะ:** {ent.get('playbook_note', '-')}"
         ),
         inline=False
@@ -1363,14 +1605,25 @@ def build_check_embed(ticker_sym):
     trend_txt = "EMA20 > EMA50" if tech.get('price', 0) > tech.get('ema20', 0) > tech.get('ema50', 0) else "Consolidation"
     amd_note = "\n• 🔥 AMD Sweep: `+3 โบนัสสับขาหลอก`" if tech.get('amd_sweep') else ""
     bsl_note = "\n• ⚠️ BSL Sweep: `-3 ระวังติดดอย ห้ามไล่ราคา`" if tech.get('bsl_sweep') else ""
+    vdu_note = "\n• 💧 Vol Dry-Up: `+2 วอลุ่มแห้ง ไร้แรงขาย`" if tech.get('volume_dryup') else ""
+    s2_note = "\n• 🚀 Minervini S2: `+2 ขาขึ้นแกร่ง Stage 2`" if tech.get('stage2_uptrend') else ""
+    div_note = "\n• ⚡ Bull Div: `+2 สัญญาณกลับตัว RSI ยกฐาน`" if tech.get('bullish_divergence') else ""
+    bdiv_note = "\n• ⚠️ Bear Div: `-2 ราคาทำ High แต่แรงซื้อแผ่ว`" if tech.get('bearish_divergence') else ""
+    dist_note = "\n• ⚠️ Heavy Selling: `-2 วอลุ่มเทขายสถาบัน`" if tech.get('distribution_day') else ""
+    rs_note = f"\n• 👑 RS Leader: `+2 ชนะตลาด {tech.get('rs_alpha', 0):+.1f}%`" if tech.get('rs_leader') else (f"\n• 🐌 RS Laggard: `-2 แพ้ตลาด {tech.get('rs_alpha', 0):+.1f}%`" if tech.get('rs_laggard') else "")
+    sqz_note = "\n• 🔋 TTM Squeeze: `+2 บีบตัวสะสมพลังรอพุ่ง`" if tech.get('ttm_squeeze') else ""
+    fvg_note = "\n• 🧲 Bullish FVG: `+2 แนวรับสถาบันรับของ`" if tech.get('bullish_fvg') else ""
+    atr_val = tech.get('atr', 0)
+    atr_txt = f"• ATR (14): `${atr_val:.2f}`\n" if atr_val > 0 else ""
     embed.add_field(
         name=f"📈 สัญญาณเทคนิค ({tech.get('score', 0)}/20)",
         value=(
             f"`[{t_bar}]`\n"
             f"• ราคา: `${tech.get('price', 0):.2f}`\n"
             f"• RSI (14): `{tech.get('rsi', 0):.1f}`\n"
+            f"{atr_txt}"
             f"• EMA Dist: `{tech.get('ema_dist', 0):+.1f}%`\n"
-            f"• Trend: `{trend_txt}`{amd_note}{bsl_note}"
+            f"• Trend: `{trend_txt}`{rs_note}{sqz_note}{fvg_note}{amd_note}{bsl_note}{vdu_note}{s2_note}{div_note}{bdiv_note}{dist_note}"
         ),
         inline=True
     )
@@ -1405,6 +1658,12 @@ def build_check_embed(ticker_sym):
 
 def build_price_embed(ticker_sym):
     ticker_sym = clean_ticker(ticker_sym)
+    if not ticker_sym:
+        return discord.Embed(
+            title="❌ ชื่อหุ้นไม่ถูกต้อง",
+            description="กรุณาระบุชื่อย่อหุ้นที่ถูกต้อง เช่น `NVDA`, `AAPL`",
+            color=0xE74C3C
+        )
     try:
         data_dict = fetch_ticker_data(ticker_sym)
         hist = None
@@ -1416,7 +1675,9 @@ def build_price_embed(ticker_sym):
             s = get_session()
             t = yf.Ticker(ticker_sym, session=s) if s else yf.Ticker(ticker_sym)
             hist = t.history(period="1mo")
-        if hist.empty:
+        if hist is not None and not hist.empty and 'Close' in hist.columns:
+            hist = hist.dropna(subset=['Close'])
+        if hist is None or hist.empty:
             return discord.Embed(
                 title="❌ ไม่พบข้อมูลราคา",
                 description=f"ไม่พบข้อมูลการซื้อขายสำหรับ `{ticker_sym}`",
@@ -1427,7 +1688,7 @@ def build_price_embed(ticker_sym):
         curr = float(close.iloc[-1])
         prev = float(close.iloc[-2]) if len(close) > 1 else curr
         chg = curr - prev
-        pct = (chg / prev) * 100 if prev else 0
+        pct = (chg / prev) * 100 if prev > 0 else 0.0
         
         day_high = float(hist['High'].iloc[-1])
         day_low = float(hist['Low'].iloc[-1])
@@ -1436,8 +1697,10 @@ def build_price_embed(ticker_sym):
         m_high = float(hist['High'].max())
         m_low = float(hist['Low'].min())
         
-        vol = float(hist['Volume'].iloc[-1])
+        vol = float(hist['Volume'].iloc[-1]) if not math.isnan(float(hist['Volume'].iloc[-1])) else 0.0
         avg_vol = float(hist['Volume'].mean())
+        if math.isnan(avg_vol):
+            avg_vol = 0.0
         rvol = vol / (avg_vol + 1e-9)
         
         color = 0x2ECC71 if chg >= 0 else 0xE74C3C
@@ -1490,12 +1753,19 @@ def build_price_embed(ticker_sym):
         embed.set_footer(text=f"Yahoo Finance Realtime • อัปเดต {datetime.datetime.now().strftime('%H:%M:%S')}")
         return embed
     except Exception as e:
-        return discord.Embed(title="❌ เกิดข้อผิดพลาด", description=str(e), color=0xE74C3C)
+        print(f"Error in build_price_embed({ticker_sym}): {type(e).__name__}: {e}", flush=True)
+        return discord.Embed(title="❌ เกิดข้อผิดพลาด", description="ไม่สามารถดึงข้อมูลราคาได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง", color=0xE74C3C)
 
 _PERIOD_ROW_MAP = {'5d': 5, '1mo': 22, '3mo': 63, '6mo': 126, '1y': 252}
 
 def build_history_embed(ticker_sym, period="1mo"):
     ticker_sym = clean_ticker(ticker_sym)
+    if not ticker_sym:
+        return discord.Embed(
+            title="❌ ชื่อหุ้นไม่ถูกต้อง",
+            description="กรุณาระบุชื่อย่อหุ้นที่ถูกต้อง เช่น `NVDA`, `AAPL`",
+            color=0xE74C3C
+        )
     period = period.lower().strip()
     if period not in _PERIOD_ROW_MAP:
         period = '1mo'
@@ -1503,15 +1773,18 @@ def build_history_embed(ticker_sym, period="1mo"):
     try:
         data_dict = fetch_ticker_data(ticker_sym)
         hist = None
+        needed_rows = _PERIOD_ROW_MAP[period]
         if data_dict and hasattr(data_dict.get('hist'), 'tail'):
             full_hist = data_dict['hist']
-            if not full_hist.empty:
-                hist = full_hist.tail(_PERIOD_ROW_MAP[period])
+            if not full_hist.empty and (len(full_hist) >= min(needed_rows, 35) or period in ('5d', '1mo')):
+                hist = full_hist.tail(needed_rows)
         if hist is None or hist.empty:
             s = get_session()
             t = yf.Ticker(ticker_sym, session=s) if s else yf.Ticker(ticker_sym)
             hist = t.history(period=period)
-        if hist.empty:
+        if hist is not None and not hist.empty and 'Close' in hist.columns:
+            hist = hist.dropna(subset=['Close'])
+        if hist is None or hist.empty:
             return discord.Embed(
                 title="❌ ไม่พบข้อมูลย้อนหลัง",
                 description=f"ไม่สามารถดึงประวัติราคาของ `{ticker_sym}` ได้",
@@ -1521,7 +1794,7 @@ def build_history_embed(ticker_sym, period="1mo"):
         recent_hist = hist.tail(8)
         first_close = float(hist['Close'].iloc[0])
         last_close = float(hist['Close'].iloc[-1])
-        period_return = ((last_close - first_close) / first_close) * 100
+        period_return = ((last_close - first_close) / first_close) * 100 if first_close > 0 else 0.0
         sign = "+" if period_return >= 0 else ""
         color = 0x2ECC71 if period_return >= 0 else 0xE74C3C
         
@@ -1545,7 +1818,7 @@ def build_history_embed(ticker_sym, period="1mo"):
             
             if i > 0:
                 prev_cl = float(recent_hist.iloc[i-1]['Close'])
-                diff_pct = ((cl - prev_cl) / prev_cl) * 100
+                diff_pct = ((cl - prev_cl) / prev_cl) * 100 if prev_cl > 0 else 0.0
                 diff_str = f"{diff_pct:+.2f}%"
             else:
                 diff_str = "N/A"
@@ -1557,7 +1830,8 @@ def build_history_embed(ticker_sym, period="1mo"):
         embed.set_footer(text=f"คลิกปุ่มด้านล่างเพื่อเปลี่ยนช่วงเวลาได้อย่างรวดเร็ว")
         return embed
     except Exception as e:
-        return discord.Embed(title="❌ เกิดข้อผิดพลาด", description=str(e), color=0xE74C3C)
+        print(f"Error in build_history_embed({ticker_sym}): {type(e).__name__}: {e}", flush=True)
+        return discord.Embed(title="❌ เกิดข้อผิดพลาด", description="ไม่สามารถดึงข้อมูลย้อนหลังได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง", color=0xE74C3C)
 
 def build_macro_embed():
     macro = get_cached_macro()
@@ -1669,18 +1943,25 @@ def build_watchlist_embed(user_name, symbols):
 def build_compare_embed(sym1, sym2):
     sym1 = clean_ticker(sym1)
     sym2 = clean_ticker(sym2)
+    if not sym1 or not sym2:
+        return discord.Embed(
+            title="❌ ชื่อหุ้นไม่ถูกต้อง",
+            description="กรุณาระบุชื่อย่อหุ้นทั้ง 2 ตัวให้ถูกต้อง เช่น `/compare NVDA AMD`",
+            color=0xE74C3C
+        )
     
-    f_macro = _executor.submit(get_cached_macro)
-    f_d1 = _executor.submit(fetch_ticker_data, sym1)
-    f_d2 = _executor.submit(fetch_ticker_data, sym2)
+    f_macro = _fetch_executor.submit(get_cached_macro)
+    f_d1 = _fetch_executor.submit(fetch_ticker_data, sym1)
+    f_d2 = _fetch_executor.submit(fetch_ticker_data, sym2)
     macro = f_macro.result()
     d1 = f_d1.result()
     d2 = f_d2.result()
     
     if not d1 or not d2:
+        missing = [s for s, d in ((sym1, d1), (sym2, d2)) if not d]
         return discord.Embed(
             title="❌ ข้อมูลไม่ครบถ้วน",
-            description=f"ไม่สามารถเปรียบเทียบได้เนื่องจากไม่พบข้อมูลของ `{sym1 if not d1 else sym2}`",
+            description=f"ไม่สามารถเปรียบเทียบได้เนื่องจากไม่พบข้อมูลของ {', '.join(f'`{m}`' for m in missing)}",
             color=0xE74C3C
         )
         
@@ -1733,6 +2014,29 @@ def _resolve_ticker_from_interaction(self_ticker: str, interaction: discord.Inte
         pass
     return ""
 
+class ConfirmActionView(discord.ui.View):
+    """ปุ่มยืนยันก่อนทำคำสั่งล้างข้อมูล (กันมือลั่น)"""
+    def __init__(self, user_id: str, on_confirm):
+        super().__init__(timeout=30)
+        self.user_id = str(user_id)
+        self._on_confirm = on_confirm
+
+    @discord.ui.button(label="ยืนยันล้างข้อมูล", style=discord.ButtonStyle.danger, emoji="✅")
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("⛔ ปุ่มยืนยันนี้ไม่ใช่ของคุณ", ephemeral=True)
+            return
+        self.stop()
+        await self._on_confirm(interaction)
+
+    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("⛔ ปุ่มยืนยันนี้ไม่ใช่ของคุณ", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="↩️ ยกเลิกการล้างข้อมูลแล้ว (ข้อมูลเดิมยังอยู่ครบ)", view=None)
+
 class WatchlistView(discord.ui.View):
     def __init__(self, user_id: str = "", user_name: str = ""):
         super().__init__(timeout=None)
@@ -1752,7 +2056,7 @@ class WatchlistView(discord.ui.View):
             return
             
         loop = asyncio.get_running_loop()
-        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name)
+        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name, clicker_id)
         view = ScanView(clicker_id, interaction.user.display_name)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
@@ -1767,18 +2071,24 @@ class WatchlistView(discord.ui.View):
             )
             return
 
-        watchlists = load_user_watchlists()
-        watchlists[target_uid] = []
-        save_user_watchlists(watchlists)
-        embed = build_watchlist_embed(self.user_name or interaction.user.display_name, [])
-        try:
-            await interaction.response.edit_message(embed=embed, view=self)
-            await interaction.followup.send("🗑️ ล้าง Watchlist ส่วนตัวของคุณเป็นค่าว่างเปล่าเรียบร้อยแล้ว", ephemeral=True)
-        except Exception:
-            if not interaction.response.is_done():
-                await interaction.response.send_message("🗑️ ล้าง Watchlist ส่วนตัวของคุณเป็นค่าว่างเปล่าเรียบร้อยแล้ว", embed=embed, ephemeral=True)
-            else:
-                await interaction.followup.send("🗑️ ล้าง Watchlist ส่วนตัวของคุณเป็นค่าว่างเปล่าเรียบร้อยแล้ว", embed=embed, ephemeral=True)
+        async def _do_clear(confirm_interaction: discord.Interaction):
+            with _file_lock:
+                watchlists = load_user_watchlists()
+                watchlists[target_uid] = []
+                save_user_watchlists(watchlists)
+            embed = build_watchlist_embed(self.user_name or confirm_interaction.user.display_name, [])
+            await confirm_interaction.response.edit_message(
+                content="🗑️ ล้าง Watchlist ส่วนตัวของคุณเป็นค่าว่างเปล่าเรียบร้อยแล้ว",
+                embed=embed,
+                view=WatchlistView(target_uid, self.user_name or confirm_interaction.user.display_name),
+            )
+
+        confirm_view = ConfirmActionView(target_uid, _do_clear)
+        await interaction.response.send_message(
+            "⚠️ **ยืนยันการล้าง Watchlist ทั้งหมด?** ข้อมูลรายชื่อหุ้นในลิสต์ส่วนตัวจะถูกลบทั้งหมด",
+            view=confirm_view,
+            ephemeral=True,
+        )
 
 class ScanView(discord.ui.View):
     def __init__(self, user_id: str = "", user_name: str = ""):
@@ -1788,8 +2098,11 @@ class ScanView(discord.ui.View):
 
     @discord.ui.button(label="รีเฟรชสแกน", style=discord.ButtonStyle.primary, emoji="🔄", custom_id="scan:refresh")
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
         clicker_id = str(interaction.user.id)
+        if self.user_id and clicker_id != self.user_id:
+            await interaction.response.send_message("⛔ ปุ่มนี้เป็นของ Watchlist ผู้ใช้อื่น กรุณาใช้ `/scan` เพื่อสแกนของคุณเอง", ephemeral=True)
+            return
+        await interaction.response.defer()
         symbols = get_user_symbols(clicker_id)
         if not symbols:
             await interaction.followup.send(
@@ -1799,7 +2112,7 @@ class ScanView(discord.ui.View):
             return
             
         loop = asyncio.get_running_loop()
-        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name)
+        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name, clicker_id)
         await interaction.edit_original_response(embed=embed, view=self)
 
     @discord.ui.button(label="ตรวจ Macro", style=discord.ButtonStyle.secondary, emoji="🌐", custom_id="scan:macro")
@@ -1822,43 +2135,49 @@ class QuickAlertModal(discord.ui.Modal, title="🔔 ตั้งแจ้งเ�
         self.add_item(self.target_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        val_str = self.target_input.value.strip().replace("$", "")
+        if not self.ticker:
+            await interaction.response.send_message("❌ ชื่อหุ้นไม่ถูกต้อง", ephemeral=True)
+            return
+        val_str = self.target_input.value.strip().replace("$", "").replace(",", "")
         try:
             target_val = float(val_str)
-            await interaction.response.defer(ephemeral=True)
-            loop = asyncio.get_running_loop()
-            ok, msg = await loop.run_in_executor(
-                _executor, add_user_alert, str(interaction.user.id), interaction.channel_id, self.ticker, target_val
-            )
-            await interaction.followup.send(msg, ephemeral=True)
+            if not _is_valid_number(target_val):
+                raise ValueError("invalid")
         except ValueError:
-            await interaction.response.send_message("❌ กรุณาระบุราคาเป้าหมายเป็นตัวเลข เช่น `250.50`", ephemeral=True)
+            await interaction.response.send_message("❌ กรุณาระบุราคาเป้าหมายเป็นตัวเลขที่มากกว่า 0 เช่น `250.50`", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
+        ok, msg = await loop.run_in_executor(
+            _executor, add_user_alert, str(interaction.user.id), interaction.channel_id, self.ticker, target_val
+        )
+        await interaction.followup.send(msg, ephemeral=True)
 
-class PortfolioAddModal(discord.ui.Modal, title="➕ บันทึกหุ้นในพอร์ต"):
+class PortfolioAddModal(discord.ui.Modal, title="➕ บันทึก/ซื้อเพิ่มหุ้นในพอร์ต"):
     def __init__(self, user_id: str, default_ticker: str = ""):
         super().__init__()
         self.user_id = str(user_id)
         self.ticker_input = discord.ui.TextInput(
             label="ชื่อย่อหุ้น (Ticker)",
-            placeholder="เช่น NVDA, AAPL, VOO",
+            placeholder="เช่น NVDA, GOOGL, VOO",
             default=default_ticker,
             min_length=1,
             max_length=10,
             required=True
         )
         self.shares_input = discord.ui.TextInput(
-            label="จำนวนหุ้น (Shares)",
-            placeholder="เช่น 1.5 หรือ 0.55989",
+            label="จำนวนหุ้น หรือ ยอดซื้อเพิ่ม (+500B / +$15 / +0.05)",
+            placeholder="ทับค่าเดิมใส่เลขปกติ | ซื้อถัวเพิ่มใส่ +500B หรือ +$15",
             min_length=1,
-            max_length=20,
+            max_length=25,
             required=True
         )
         self.cost_input = discord.ui.TextInput(
-            label="ต้นทุนเฉลี่ย USD (Avg Cost)",
-            placeholder="เช่น 210.50",
-            min_length=1,
+            label="ต้นทุนเฉลี่ย หรือ ราคาที่เคาะซื้อ USD (เว้นว่าง=ราคาตลาด)",
+            placeholder="เช่น 279.84 (ถ้าซื้อเพิ่มแล้วเว้นว่าง จะใช้ราคาตลาดล่าสุด)",
+            min_length=0,
             max_length=20,
-            required=True
+            required=False
         )
         self.cat_input = discord.ui.TextInput(
             label="หมวดหมู่ (Category - ไม่บังคับ)",
@@ -1872,23 +2191,75 @@ class PortfolioAddModal(discord.ui.Modal, title="➕ บันทึกหุ้
         self.add_item(self.cat_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        sym = clean_ticker(self.ticker_input.value.strip())
-        try:
-            shares = float(self.shares_input.value.strip().replace(",", ""))
-            avg_cost = float(self.cost_input.value.strip().replace("$", "").replace(",", ""))
-            if shares <= 0 or avg_cost < 0:
-                raise ValueError()
-        except ValueError:
-            await interaction.response.send_message("❌ กรุณาระบุจำนวนหุ้นและราคาต้นทุนเป็นตัวเลขที่ถูกต้อง (มากกว่า 0)", ephemeral=True)
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("⛔ คุณไม่มีสิทธิ์แก้ไขพอร์ตของผู้อื่น", ephemeral=True)
             return
+        sym = clean_ticker(self.ticker_input.value.strip())
+        if not sym:
+            await interaction.response.send_message("❌ ชื่อหุ้นไม่ถูกต้อง กรุณาระบุเช่น `NVDA`, `VOO`", ephemeral=True)
+            return
+        raw_sh = self.shares_input.value.strip().replace(",", "").upper()
+        raw_cost = (self.cost_input.value or "").strip().replace("$", "").replace(",", "")
+        is_buy_more = raw_sh.startswith("+")
+        val_str = raw_sh.lstrip("+").strip()
 
         await interaction.response.defer(ephemeral=True)
-        cat = self.cat_input.value.strip() or "General"
-        add_user_portfolio_holding(self.user_id, sym, shares, avg_cost, cat)
         loop = asyncio.get_running_loop()
+
+        try:
+            avg_cost = float(raw_cost) if raw_cost else 0.0
+            if raw_cost and not _is_valid_number(avg_cost):
+                raise ValueError("invalid_cost")
+            if avg_cost <= 0:
+                item = await loop.run_in_executor(_executor, fetch_ticker_data, sym)
+                if item and item.get("tech") and float(item["tech"].get("price", 0)) > 0:
+                    avg_cost = float(item["tech"]["price"])
+                else:
+                    raise ValueError("no_price")
+
+            p_data = get_user_portfolio_data(self.user_id) or {}
+            fx_r = float((p_data.get("portfolio_summary") or {}).get("fx_rate_thb") or 33.67)
+            spend_thb = 0.0
+
+            if val_str.endswith("THB") or val_str.endswith("B") or val_str.endswith("บาท"):
+                num_s = re.sub(r"[^0-9.]", "", val_str)
+                spend_thb = float(num_s)
+                usd_amt = spend_thb / fx_r
+                shares = usd_amt / avg_cost
+                is_buy_more = True
+            elif val_str.startswith("$") or val_str.endswith("USD"):
+                num_s = re.sub(r"[^0-9.]", "", val_str)
+                usd_amt = float(num_s)
+                spend_thb = round(usd_amt * fx_r, 2)
+                shares = usd_amt / avg_cost
+                is_buy_more = True
+            else:
+                shares = float(val_str)
+
+            if not _is_valid_number(shares) or not _is_valid_number(avg_cost):
+                raise ValueError("invalid_num")
+        except ValueError as ve:
+            err_code = str(ve)
+            if err_code == "invalid_cost":
+                await interaction.followup.send("❌ ราคาต้นทุน/ราคาเคาะซื้อต้องเป็นตัวเลขที่มากกว่า 0 เช่น `210.50`", ephemeral=True)
+            elif err_code == "no_price":
+                await interaction.followup.send(f"❌ ไม่สามารถดึงราคาตลาดล่าสุดของ `{sym}` ได้ในขณะนี้ กรุณาระบุราคาต้นทุน (USD) เอง", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ กรุณาระบุจำนวนหุ้น/ยอดซื้อเพิ่ม (เช่น `0.67`, `+500B`, `+$15`) ให้ถูกต้อง", ephemeral=True)
+            return
+        except Exception:
+            await interaction.followup.send("❌ เกิดข้อผิดพลาดในการคำนวณข้อมูล กรุณาตรวจสอบตัวเลขแล้วลองใหม่", ephemeral=True)
+            return
+
+        cat = _clean_category(self.cat_input.value)
+        mode = "buy" if is_buy_more else "set"
+        if not add_user_portfolio_holding(self.user_id, sym, shares, avg_cost, cat, mode=mode, spend_thb=spend_thb):
+            await interaction.followup.send(f"⚠️ ไม่สามารถบันทึก `{sym}` ได้ (อาจครบเพดาน {_MAX_PORTFOLIO_HOLDINGS} หุ้นในพอร์ตแล้ว)", ephemeral=True)
+            return
         embed = await loop.run_in_executor(_executor, build_portfolio_embed, self.user_id, interaction.user.display_name, True)
         view = PortfolioView(self.user_id, interaction.user.display_name)
-        await interaction.followup.send(f"✅ บันทึกหุ้น `{sym}` (จำนวน {shares:g} หุ้น @ ${avg_cost:.2f}) เข้าพอร์ตเรียบร้อย!", embed=embed, view=view, ephemeral=True)
+        action_txt = f"ซื้อถัวเพิ่ม `{sym}` (+{shares:.5f} หุ้น @ ${avg_cost:.2f})" if mode == "buy" else f"อัปเดต `{sym}` ({shares:g} หุ้น @ ${avg_cost:.2f})"
+        await interaction.followup.send(f"✅ {action_txt} และคำนวณต้นทุนเฉลี่ยใหม่เรียบร้อย!", embed=embed, view=view, ephemeral=True)
 
 class PortfolioRemoveModal(discord.ui.Modal, title="🗑️ ลบหุ้นออกจากพอร์ต"):
     def __init__(self, user_id: str):
@@ -1904,7 +2275,13 @@ class PortfolioRemoveModal(discord.ui.Modal, title="🗑️ ลบหุ้น�
         self.add_item(self.ticker_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("⛔ คุณไม่มีสิทธิ์แก้ไขพอร์ตของผู้อื่น", ephemeral=True)
+            return
         sym = clean_ticker(self.ticker_input.value.strip())
+        if not sym:
+            await interaction.response.send_message("❌ ชื่อหุ้นไม่ถูกต้อง", ephemeral=True)
+            return
         ok = remove_user_portfolio_holding(self.user_id, sym)
         if not ok:
             await interaction.response.send_message(f"⚠️ ไม่พบหุ้น `{sym}` ในพอร์ตของคุณ", ephemeral=True)
@@ -1914,6 +2291,48 @@ class PortfolioRemoveModal(discord.ui.Modal, title="🗑️ ลบหุ้น�
         embed = await loop.run_in_executor(_executor, build_portfolio_embed, self.user_id, interaction.user.display_name, True)
         view = PortfolioView(self.user_id, interaction.user.display_name)
         await interaction.followup.send(f"🗑️ ลบหุ้น `{sym}` ออกจากพอร์ตแล้ว", embed=embed, view=view, ephemeral=True)
+
+class PortfolioCashModal(discord.ui.Modal, title="💵 ตั้งค่า/เติมเงินสดในพอร์ต (THB)"):
+    def __init__(self, user_id: str, current_cash: float = 0.0):
+        super().__init__()
+        self.user_id = str(user_id)
+        self.cash_input = discord.ui.TextInput(
+            label="ยอดเงินสด THB (ตั้งใหม่ หรือ +เติม / -ถอน)",
+            placeholder="เช่น 5000 (ตั้งยอด), +2000 (เติมเพิ่ม), -500 (ถอน)",
+            default=f"{current_cash:.2f}" if current_cash > 0 else "",
+            min_length=1,
+            max_length=20,
+            required=True
+        )
+        self.add_item(self.cash_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("⛔ คุณไม่มีสิทธิ์แก้ไขพอร์ตของผู้อื่น", ephemeral=True)
+            return
+        raw = self.cash_input.value.strip().replace(",", "").replace("฿", "").upper().replace("THB", "").replace("B", "").strip()
+        mode = "set"
+        if raw.startswith("+"):
+            mode = "add"
+            raw = raw[1:].strip()
+        elif raw.startswith("-"):
+            mode = "sub"
+            raw = raw[1:].strip()
+        try:
+            amt = float(raw)
+        except ValueError:
+            await interaction.response.send_message("❌ กรุณาระบุตัวเลขที่ถูกต้อง เช่น `5000`, `+2000`, หรือ `-500`", ephemeral=True)
+            return
+        ok, new_cash = set_user_portfolio_cash(self.user_id, amt, mode=mode)
+        if not ok:
+            await interaction.response.send_message("❌ ยอดเงินสดไม่ถูกต้อง (ต้องเป็นตัวเลขที่ไม่ติดลบ)", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
+        embed = await loop.run_in_executor(_executor, build_portfolio_embed, self.user_id, interaction.user.display_name, False)
+        view = PortfolioView(self.user_id, interaction.user.display_name)
+        label = {"set": "ตั้งยอดเงินสดใหม่", "add": f"เติมเงินสด +{amt:,.2f} THB", "sub": f"หัก/ถอนเงินสด -{amt:,.2f} THB"}[mode]
+        await interaction.followup.send(f"💵 {label} เรียบร้อย! เงินสดคงเหลือ: **{new_cash:,.2f} THB**", embed=embed, view=view, ephemeral=True)
 
 class PortfolioView(discord.ui.View):
     def __init__(self, user_id: str = "", user_name: str = ""):
@@ -1949,6 +2368,17 @@ class PortfolioView(discord.ui.View):
             return
         await interaction.response.send_modal(PortfolioRemoveModal(self.user_id or clicker_id))
 
+    @discord.ui.button(label="เงินสด", style=discord.ButtonStyle.secondary, emoji="💵", custom_id="port:cash")
+    async def cash_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        clicker_id = str(interaction.user.id)
+        if self.user_id and clicker_id != self.user_id:
+            await interaction.response.send_message("⛔ กรุณาใช้คำสั่ง `/portfolio` เพื่อจัดการพอร์ตของคุณเอง", ephemeral=True)
+            return
+        target_uid = self.user_id or clicker_id
+        p_data = get_user_portfolio_data(target_uid) or {}
+        curr_cash = float((p_data.get("portfolio_summary") or {}).get("cash_thb") or 0.0)
+        await interaction.response.send_modal(PortfolioCashModal(target_uid, curr_cash))
+
     @discord.ui.button(label="สแกนหุ้นในพอร์ต", style=discord.ButtonStyle.success, emoji="📊", custom_id="port:scan")
     async def scan_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         clicker_id = str(interaction.user.id)
@@ -1964,13 +2394,11 @@ class PortfolioView(discord.ui.View):
                 await interaction.followup.send("⚠️ ไม่พบรายชื่อหุ้นในพอร์ตโฟลิโอของคุณ กรุณากดปุ่ม `[➕ เพิ่ม/แก้หุ้น]` ก่อน", ephemeral=True)
                 return
             loop = asyncio.get_running_loop()
-            embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, f"Portfolio ({interaction.user.display_name})")
+            embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, f"Portfolio ({interaction.user.display_name})", target_uid)
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
-            print(f"Error in scan_btn: {e}")
-            import traceback
-            traceback.print_exc()
-            await interaction.followup.send(f"❌ เกิดข้อผิดพลาดในการสแกนหุ้น: {e}", ephemeral=True)
+            print(f"Error in scan_btn: {type(e).__name__}: {e}", flush=True)
+            await interaction.followup.send("❌ เกิดข้อผิดพลาดในการสแกนหุ้น กรุณาลองใหม่อีกครั้ง", ephemeral=True)
 
 class AlertsView(discord.ui.View):
     def __init__(self, user_id: str = "", user_name: str = ""):
@@ -1980,18 +2408,59 @@ class AlertsView(discord.ui.View):
 
     @discord.ui.button(label="รีเฟรชรายการ", style=discord.ButtonStyle.secondary, emoji="🔄", custom_id="alerts:refresh")
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target_uid = self.user_id or str(interaction.user.id)
+        clicker_id = str(interaction.user.id)
+        if self.user_id and clicker_id != self.user_id:
+            await interaction.response.send_message("⛔ ปุ่มนี้เป็นรายการแจ้งเตือนของผู้ใช้อื่น กรุณาใช้ `/alert_list` เพื่อดูของคุณ", ephemeral=True)
+            return
+        target_uid = self.user_id or clicker_id
         embed = build_alerts_embed(self.user_name or interaction.user.display_name, target_uid)
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="ล้างการแจ้งเตือนทั้งหมด", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="alerts:clear")
     async def clear_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target_uid = self.user_id or str(interaction.user.id)
-        alerts = load_user_alerts()
-        alerts[target_uid] = []
-        save_user_alerts(alerts)
-        embed = build_alerts_embed(self.user_name or interaction.user.display_name, target_uid)
-        await interaction.response.edit_message(embed=embed, view=self)
+        clicker_id = str(interaction.user.id)
+        if self.user_id and clicker_id != self.user_id:
+            await interaction.response.send_message("⛔ คุณไม่สามารถล้างรายการแจ้งเตือนของผู้ใช้อื่นได้ครับ", ephemeral=True)
+            return
+        target_uid = self.user_id or clicker_id
+
+        async def _do_clear(confirm_interaction: discord.Interaction):
+            with _file_lock:
+                alerts = load_user_alerts()
+                alerts[target_uid] = []
+                save_user_alerts(alerts)
+            embed = build_alerts_embed(self.user_name or confirm_interaction.user.display_name, target_uid)
+            await confirm_interaction.response.edit_message(
+                content="🗑️ ล้างรายการแจ้งเตือนทั้งหมดเรียบร้อยแล้ว",
+                embed=embed,
+                view=AlertsView(target_uid, self.user_name or confirm_interaction.user.display_name),
+            )
+
+        confirm_view = ConfirmActionView(target_uid, _do_clear)
+        await interaction.response.send_message(
+            "⚠️ **ยืนยันการล้างแจ้งเตือนราคาทั้งหมด?** รายการแจ้งเตือนที่ตั้งไว้ทั้งหมดจะถูกลบ",
+            view=confirm_view,
+            ephemeral=True,
+        )
+
+def _toggle_watchlist_ticker(user_id: str, sym: str) -> tuple[bool, str, bool]:
+    """สลับเพิ่ม/ลบหุ้นใน Watchlist อย่างปลอดภัยภายใต้ _file_lock และจำกัดไม่เกิน 50 ตัว"""
+    if not sym:
+        return False, "❌ ชื่อหุ้นไม่ถูกต้อง", False
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        current = list(watchlists.get(user_id, []))
+        if sym in current:
+            current.remove(sym)
+            watchlists[user_id] = current
+            save_user_watchlists(watchlists)
+            return True, f"🗑️ ลบ `{sym}` ออกจาก Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (คงเหลือ {len(current)} ตัว)", False
+        if len(current) >= _MAX_WATCHLIST_SIZE:
+            return False, f"⚠️ Watchlist ของคุณมีหุ้นครบ {_MAX_WATCHLIST_SIZE} ตัวแล้ว กรุณาลบตัวที่ไม่ใช้ออกก่อนครับ", False
+        current.append(sym)
+        watchlists[user_id] = current
+        save_user_watchlists(watchlists)
+        return True, f"⭐ เพิ่ม `{sym}` เข้า Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (ปัจจุบันมี {len(current)} ตัว)", True
 
 class CheckView(discord.ui.View):
     def __init__(self, ticker: str = "", user_id: str = ""):
@@ -2008,6 +2477,9 @@ class CheckView(discord.ui.View):
     @discord.ui.button(label="ดูราคาละเอียด", style=discord.ButtonStyle.primary, emoji="📈", custom_id="check:price")
     async def price_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_price_embed, sym)
@@ -2017,6 +2489,9 @@ class CheckView(discord.ui.View):
     @discord.ui.button(label="ประวัติราคา", style=discord.ButtonStyle.secondary, emoji="📅", custom_id="check:hist")
     async def hist_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_history_embed, sym, "1mo")
@@ -2026,6 +2501,9 @@ class CheckView(discord.ui.View):
     @discord.ui.button(label="ตั้งเตือนราคา", style=discord.ButtonStyle.secondary, emoji="🔔", custom_id="check:alert")
     async def alert_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         curr_p = get_cached_price(sym)
         modal = QuickAlertModal(sym, curr_p)
         await interaction.response.send_modal(modal)
@@ -2033,23 +2511,20 @@ class CheckView(discord.ui.View):
     @discord.ui.button(label="Watchlist", style=discord.ButtonStyle.secondary, emoji="⭐", custom_id="check:wl")
     async def wl_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         clicker_id = str(interaction.user.id)
-        watchlists = load_user_watchlists()
-        current = watchlists.get(clicker_id, [])
-        if sym in current:
-            current.remove(sym)
-            msg = f"🗑️ ลบ `{sym}` ออกจาก Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (คงเหลือ {len(current)} ตัว)"
-            button.label = "เพิ่มลง Watchlist"
-            button.style = discord.ButtonStyle.success
-        else:
-            current.append(sym)
-            msg = f"⭐ เพิ่ม `{sym}` เข้า Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (ปัจจุบันมี {len(current)} ตัว)"
-            button.label = "ลบจาก Watchlist"
-            button.style = discord.ButtonStyle.danger
-            
-        watchlists[clicker_id] = current
-        save_user_watchlists(watchlists)
+        ok, msg, added_now = _toggle_watchlist_ticker(clicker_id, sym)
+        if ok:
+            button.label = "ลบจาก Watchlist" if added_now else "เพิ่มลง Watchlist"
+            button.style = discord.ButtonStyle.danger if added_now else discord.ButtonStyle.success
+            if self.user_id and clicker_id == self.user_id:
+                try:
+                    await interaction.edit_original_response(view=self)
+                except Exception:
+                    pass
         await interaction.followup.send(msg, ephemeral=True)
 
 class PriceView(discord.ui.View):
@@ -2067,15 +2542,21 @@ class PriceView(discord.ui.View):
     @discord.ui.button(label="วิเคราะห์ 5 มิติ", style=discord.ButtonStyle.primary, emoji="🎯", custom_id="price:check")
     async def check_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
-        embed, _ = await loop.run_in_executor(_executor, build_check_embed, sym)
+        embed, _ = await loop.run_in_executor(_executor, build_check_embed, sym, str(interaction.user.id))
         view = CheckView(sym, str(interaction.user.id))
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="ประวัติราคา", style=discord.ButtonStyle.secondary, emoji="📅", custom_id="price:hist")
     async def hist_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_history_embed, sym, "1mo")
@@ -2085,6 +2566,9 @@ class PriceView(discord.ui.View):
     @discord.ui.button(label="ตั้งเตือนราคา", style=discord.ButtonStyle.secondary, emoji="🔔", custom_id="price:alert")
     async def alert_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         curr_p = get_cached_price(sym)
         modal = QuickAlertModal(sym, curr_p)
         await interaction.response.send_modal(modal)
@@ -2092,23 +2576,20 @@ class PriceView(discord.ui.View):
     @discord.ui.button(label="Watchlist", style=discord.ButtonStyle.secondary, emoji="⭐", custom_id="price:wl")
     async def wl_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
         clicker_id = str(interaction.user.id)
-        watchlists = load_user_watchlists()
-        current = watchlists.get(clicker_id, [])
-        if sym in current:
-            current.remove(sym)
-            msg = f"🗑️ ลบ `{sym}` ออกจาก Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (คงเหลือ {len(current)} ตัว)"
-            button.label = "เพิ่มลง Watchlist"
-            button.style = discord.ButtonStyle.success
-        else:
-            current.append(sym)
-            msg = f"⭐ เพิ่ม `{sym}` เข้า Watchlist ส่วนตัวของคุณเรียบร้อยแล้ว (ปัจจุบันมี {len(current)} ตัว)"
-            button.label = "ลบจาก Watchlist"
-            button.style = discord.ButtonStyle.danger
-            
-        watchlists[clicker_id] = current
-        save_user_watchlists(watchlists)
+        ok, msg, added_now = _toggle_watchlist_ticker(clicker_id, sym)
+        if ok:
+            button.label = "ลบจาก Watchlist" if added_now else "เพิ่มลง Watchlist"
+            button.style = discord.ButtonStyle.danger if added_now else discord.ButtonStyle.success
+            if self.user_id and clicker_id == self.user_id:
+                try:
+                    await interaction.edit_original_response(view=self)
+                except Exception:
+                    pass
         await interaction.followup.send(msg, ephemeral=True)
 
 class HistoryView(discord.ui.View):
@@ -2127,6 +2608,9 @@ class HistoryView(discord.ui.View):
 
     async def change_period(self, interaction: discord.Interaction, period: str):
         sym = _resolve_ticker_from_interaction(self.ticker, interaction)
+        if not sym:
+            await interaction.response.send_message("❌ ไม่พบชื่อหุ้นสำหรับคำสั่งนี้", ephemeral=True)
+            return
         await interaction.response.defer()
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_history_embed, sym, period)
@@ -2157,10 +2641,13 @@ class HistoryView(discord.ui.View):
 
 async def ticker_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     user_id = str(interaction.user.id)
+    p_data = get_user_portfolio_data(user_id) or {}
+    port_syms = list((p_data.get("holdings") or {}).keys())
+    port_set = set(port_syms)
     watchlist = get_user_symbols(user_id)
     watchlist_set = set(watchlist)
-    combined = list(dict.fromkeys(watchlist + POPULAR_TICKERS))
-    
+    combined = list(dict.fromkeys(port_syms + watchlist + POPULAR_TICKERS))
+
     current = clean_ticker(current)
     if not current:
         matches = combined[:25]
@@ -2168,12 +2655,18 @@ async def ticker_autocomplete(interaction: discord.Interaction, current: str) ->
         matches = [s for s in combined if current in s]
         if current not in matches and len(current) <= 5:
             matches.insert(0, current)
-            
+
+    def _tag(sym: str) -> str:
+        if sym in port_set and sym in watchlist_set:
+            return f"{sym} (💼 พอร์ต + ⭐ WL)"
+        if sym in port_set:
+            return f"{sym} (💼 ในพอร์ต)"
+        if sym in watchlist_set:
+            return f"{sym} (⭐ ใน Watchlist)"
+        return sym
+
     return [
-        app_commands.Choice(
-            name=f"{sym} {'(⭐ ใน Watchlist)' if sym in watchlist_set else ''}".strip(),
-            value=sym
-        )
+        app_commands.Choice(name=_tag(sym), value=sym)
         for sym in matches[:25]
     ]
 
@@ -2183,6 +2676,22 @@ async def watchlist_autocomplete(interaction: discord.Interaction, current: str)
     current = current.upper().strip()
     matches = [s for s in watchlist if current in s] if current else watchlist
     return [app_commands.Choice(name=sym, value=sym) for sym in matches[:25]]
+
+async def portfolio_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    user_id = str(interaction.user.id)
+    p_data = get_user_portfolio_data(user_id) or {}
+    holdings = list((p_data.get("holdings") or {}).keys())
+    current = current.upper().strip()
+    matches = [s for s in holdings if current in s] if current else holdings
+    return [app_commands.Choice(name=f"{sym} (💼 ในพอร์ต)", value=sym) for sym in matches[:25]]
+
+async def alert_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    user_id = str(interaction.user.id)
+    u_alerts = load_user_alerts().get(user_id, [])
+    active_syms = list(dict.fromkeys([a.get("symbol", "") for a in u_alerts if a.get("symbol")]))
+    current = current.upper().strip()
+    matches = [s for s in active_syms if current in s] if current else active_syms
+    return [app_commands.Choice(name=f"{sym} (🔔 ตั้งเตือนไว้)", value=sym) for sym in matches[:25]]
 
 async def period_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     options = [
@@ -2248,14 +2757,22 @@ async def perform_graceful_restart(reason: str):
     _restart_in_progress = True
     print(f"\n🔄 [AUTO-RESTART TRIGGERED] Reason: {reason}", flush=True)
 
-    # 1. Clean up HTTP health server to free port 8080 immediately
+    # 1. Flush pending cloud sync before exit so recent user edits aren't lost
+    if _SUPABASE_ENABLED:
+        try:
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(loop.run_in_executor(_executor, _supabase_upsert_all_users), timeout=5.0)
+        except Exception:
+            pass
+
+    # 2. Clean up HTTP health server to free port 8080 immediately
     if _health_runner:
         try:
             await _health_runner.cleanup()
         except Exception:
             pass
 
-    # 2. Close Discord connection
+    # 3. Close Discord connection
     try:
         await bot.close()
     except Exception:
@@ -2305,15 +2822,25 @@ async def perform_graceful_restart(reason: str):
 
 async def start_health_check_server():
     global _health_runner
-    port = int(os.getenv("PORT", 8080))
+    try:
+        port = int(os.getenv("PORT", 8080))
+        if not (1 <= port <= 65535):
+            port = 8080
+    except (TypeError, ValueError):
+        port = 8080
+
     async def handle_ping(request):
         return web.Response(
             text="Bot is running OK",
             content_type="text/plain",
-            headers={"Connection": "close"}
+            headers={
+                "Connection": "close",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            }
         )
         
-    app = web.Application()
+    app = web.Application(client_max_size=65536)
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_ping)
     app.router.add_head("/", handle_ping)
@@ -2378,6 +2905,53 @@ class StockAdvisorBot(commands.Bot):
 
 bot = StockAdvisorBot()
 
+async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+    if interaction.guild_id is None:
+        return True
+    if MY_GUILD_ID and interaction.guild_id != MY_GUILD_ID:
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message("⛔ บอทนี้จำกัดการใช้งานเฉพาะเซิร์ฟเวอร์ที่ได้รับอนุญาตเท่านั้น", ephemeral=True)
+            except Exception:
+                pass
+        return False
+    return True
+
+bot.tree.interaction_check = _tree_interaction_check
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        return
+    if isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"⏳ กรุณารออีก {error.retry_after:.1f} วินาทีก่อนใช้คำสั่งนี้อีกครั้ง"
+    else:
+        cmd_name = interaction.command.name if interaction.command else "unknown"
+        print(f"❌ [Slash Error] /{cmd_name}: {type(error).__name__}: {error}", flush=True)
+        msg = "❌ เกิดข้อผิดพลาดในการประมวลผลคำสั่ง กรุณาลองใหม่อีกครั้งในอีกสักครู่"
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(msg, ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+    except Exception:
+        pass
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        cmd_name = ctx.command.name if ctx.command else ""
+        await ctx.send(f"⚠️ ระบุข้อมูลไม่ครบสำหรับ `!{cmd_name}` (ขาด `{error.param.name}`) — ดูวิธีใช้ได้ที่ `!help`")
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("⚠️ รูปแบบพารามิเตอร์ไม่ถูกต้อง กรุณาตรวจสอบตัวเลขหรือชื่อหุ้นแล้วลองใหม่")
+        return
+    cmd_name = ctx.command.name if ctx.command else "unknown"
+    print(f"❌ [Prefix Error] !{cmd_name}: {type(error).__name__}: {error}", flush=True)
+    await ctx.send("❌ เกิดข้อผิดพลาดในการประมวลผลคำสั่ง กรุณาลองใหม่อีกครั้ง")
+
 # ==================== BACKGROUND TASKS ====================
 
 @tasks.loop(minutes=3)
@@ -2394,12 +2968,12 @@ async def check_price_alerts_task():
 
         loop = asyncio.get_running_loop()
         def _fetch_all(sym_list):
-            items = list(_executor.map(fetch_ticker_data, sym_list))
+            items = list(_fetch_executor.map(fetch_ticker_data, sym_list))
             return {s: it for s, it in zip(sym_list, items) if it}
 
         fetched_dict = await loop.run_in_executor(_executor, _fetch_all, list(all_symbols))
 
-        updated_any = False
+        triggered_hits = []
         for uid, u_alerts in alerts.items():
             for a in u_alerts:
                 if a.get('triggered', False):
@@ -2416,43 +2990,57 @@ async def check_price_alerts_task():
 
                 is_hit = (curr_price >= target) if cond == 'gte' else (curr_price <= target)
                 if is_hit:
-                    a['triggered'] = True
-                    updated_any = True
-                    channel_id = a.get('channel_id')
-                    try:
-                        channel = bot.get_channel(channel_id) if channel_id else None
-                        if not channel and MY_GUILD_ID:
-                            guild = bot.get_guild(MY_GUILD_ID)
-                            if guild and guild.text_channels:
-                                channel = guild.text_channels[0]
+                    triggered_hits.append((str(uid), a.get('id'), sym, target, curr_price, cond, a.get('channel_id')))
 
-                        embed = discord.Embed(
-                            title=f"🚨 แจ้งเตือนราคาหุ้นแตะเป้าหมาย: {sym}",
-                            description=f"<@{uid}> หุ้น **{sym}** แตะราคาเป้าหมายที่คุณตั้งไว้แล้วครับ!",
-                            color=0x2ECC71 if cond == 'gte' else 0xE74C3C
-                        )
-                        embed.add_field(name="🎯 ราคาเป้าหมาย", value=f"**${target:.2f}**", inline=True)
-                        embed.add_field(name="💲 ราคาล่าสุด", value=f"**${curr_price:.2f}**", inline=True)
-                        cond_text = "ขึ้นแตะหรือทะลุเป้า" if cond == 'gte' else "ย่อลงแตะหรือต่ำกว่าเป้า"
-                        embed.add_field(name="📌 เงื่อนไข", value=f"{cond_text}", inline=True)
-                        embed.set_footer(text="ระบบปิดการแจ้งเตือนรายการนี้แล้ว (เพื่อป้องกันการแจ้งซ้ำ) คุณสามารถตั้งใหม่ได้ตลอดเวลา")
+        if triggered_hits:
+            to_notify = []
+            with _file_lock:
+                latest_alerts = load_user_alerts()
+                for uid, aid, sym, target, curr_price, cond, chan_id in triggered_hits:
+                    for item in latest_alerts.get(uid, []):
+                        if not item.get('triggered', False) and item.get('id') == aid and item.get('symbol') == sym:
+                            item['triggered'] = True
+                            to_notify.append((uid, sym, target, curr_price, cond, chan_id))
+                            break
+                if to_notify:
+                    save_user_alerts(latest_alerts)
 
-                        sent_dm = False
+            for uid, sym, target, curr_price, cond, channel_id in to_notify:
+                try:
+                    channel = bot.get_channel(channel_id) if channel_id else None
+                    if channel is None and channel_id:
                         try:
-                            user = await bot.fetch_user(int(uid))
-                            if user:
-                                await user.send(content=f"<@{uid}> 🔔 **แจ้งเตือนราคาหุ้นแตะเป้าหมาย!**", embed=embed)
-                                sent_dm = True
-                        except Exception as dm_err:
-                            print(f"Could not send DM to {uid}: {dm_err}")
+                            fetched_ch = await bot.fetch_channel(int(channel_id))
+                            # ส่งกลับช่องเดิมเฉพาะกรณีเป็น TextChannel ในกิลด์ที่อนุญาต (ห้ามรั่ว DM ไปห้องรวม)
+                            if isinstance(fetched_ch, discord.TextChannel) and (not MY_GUILD_ID or fetched_ch.guild.id == MY_GUILD_ID):
+                                channel = fetched_ch
+                        except Exception:
+                            channel = None
 
-                        if not sent_dm and channel:
-                            await channel.send(content=f"<@{uid}> 🔔 **แจ้งเตือนราคาหุ้นแตะเป้าหมาย!**", embed=embed)
-                    except Exception as ex:
-                        print(f"Error sending alert notification for {sym} to {uid}: {ex}")
+                    embed = discord.Embed(
+                        title=f"🚨 แจ้งเตือนราคาหุ้นแตะเป้าหมาย: {sym}",
+                        description=f"<@{uid}> หุ้น **{sym}** แตะราคาเป้าหมายที่คุณตั้งไว้แล้วครับ!",
+                        color=0x2ECC71 if cond == 'gte' else 0xE74C3C
+                    )
+                    embed.add_field(name="🎯 ราคาเป้าหมาย", value=f"**${target:.2f}**", inline=True)
+                    embed.add_field(name="💲 ราคาล่าสุด", value=f"**${curr_price:.2f}**", inline=True)
+                    cond_text = "ขึ้นแตะหรือทะลุเป้า" if cond == 'gte' else "ย่อลงแตะหรือต่ำกว่าเป้า"
+                    embed.add_field(name="📌 เงื่อนไข", value=f"{cond_text}", inline=True)
+                    embed.set_footer(text="ระบบปิดการแจ้งเตือนรายการนี้แล้ว (เพื่อป้องกันการแจ้งซ้ำ) คุณสามารถตั้งใหม่ได้ตลอดเวลา")
 
-        if updated_any:
-            save_user_alerts(alerts)
+                    sent_dm = False
+                    try:
+                        user = await bot.fetch_user(int(uid))
+                        if user:
+                            await user.send(content=f"<@{uid}> 🔔 **แจ้งเตือนราคาหุ้นแตะเป้าหมาย!**", embed=embed)
+                            sent_dm = True
+                    except Exception as dm_err:
+                        print(f"Could not send DM to {uid}: {dm_err}")
+
+                    if not sent_dm and isinstance(channel, discord.TextChannel):
+                        await channel.send(content=f"<@{uid}> 🔔 **แจ้งเตือนราคาหุ้นแตะเป้าหมาย!**", embed=embed)
+                except Exception as ex:
+                    print(f"Error sending alert notification for {sym} to {uid}: {ex}")
         trim_memory()
     except Exception as e:
         print(f"Error in check_price_alerts_task: {e}")
@@ -2512,7 +3100,9 @@ async def before_auto_health_watchdog_task():
 
 @bot.check
 async def globally_block_unauthorized_guilds(ctx):
-    if ctx.guild is None or ctx.guild.id != MY_GUILD_ID:
+    if ctx.guild is None:
+        return True
+    if MY_GUILD_ID and ctx.guild.id != MY_GUILD_ID:
         return False
     return True
 
@@ -2556,59 +3146,62 @@ async def slash_watchlist(interaction: discord.Interaction):
     view = WatchlistView(user_id, interaction.user.display_name)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="add", description="เพิ่มหุ้นเข้า Watchlist ส่วนตัว (ใส่ได้หลายตัวคั่นด้วยลูกน้ำ เช่น NVDA, AAPL, PLTR)")
-@app_commands.describe(tickers="ชื่อย่อหุ้นที่ต้องการเพิ่ม (คั่นด้วยลูกน้ำหรือเว้นวรรค)")
-async def slash_add(interaction: discord.Interaction, tickers: str):
-    await interaction.response.defer(ephemeral=True)
-    user_id = str(interaction.user.id)
-    raw_list = [clean_ticker(s) for s in re.split(r'[,;\s]+', tickers) if clean_ticker(s)]
-    
+async def _add_tickers_for_user(user_id: str, tickers: str, display_name: str, usage_hint: str) -> tuple[discord.Embed | None, str | None]:
+    raw_list = list(dict.fromkeys([clean_ticker(s) for s in re.split(r'[,;\s]+', tickers) if clean_ticker(s)]))
     if not raw_list:
-        await interaction.followup.send("⚠️ กรุณาระบุชื่อย่อหุ้น เช่น `/add AAPL` หรือ `/add NVDA, AMD, PLTR`", ephemeral=True)
-        return
-        
+        return None, usage_hint
     if len(raw_list) > 15:
-        await interaction.followup.send("⚠️ เพื่อความเสถียรของระบบ กรุณาเพิ่มหุ้นไม่เกินครั้งละ 15 ตัวครับ", ephemeral=True)
-        return
+        return None, "⚠️ เพื่อความเสถียรของระบบ กรุณาเพิ่มหุ้นไม่เกินครั้งละ 15 ตัวครับ"
 
-    watchlists = load_user_watchlists()
-    current = watchlists.get(user_id, [])
-    
-    if len(current) >= 50:
-        await interaction.followup.send("⚠️ Watchlist ของคุณมีหุ้นครบ 50 ตัวแล้ว (จำกัดสูงสุด 50 ตัว) กรุณาลบตัวที่ไม่ใช้ออกก่อนครับ", ephemeral=True)
-        return
-    
-    loop = asyncio.get_running_loop()
-    added = []
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        current_snap = list(watchlists.get(user_id, []))
+
+    if len(current_snap) >= _MAX_WATCHLIST_SIZE:
+        return None, f"⚠️ Watchlist ของคุณมีหุ้นครบ {_MAX_WATCHLIST_SIZE} ตัวแล้ว (จำกัดสูงสุด {_MAX_WATCHLIST_SIZE} ตัว) กรุณาลบตัวที่ไม่ใช้ออกก่อนครับ"
+
     already_in = []
-    invalid = []
     to_validate = []
-
     for sym in raw_list:
-        if len(current) + len(added) + len(to_validate) >= 50:
+        if len(current_snap) + len(to_validate) >= _MAX_WATCHLIST_SIZE:
             break
-        if sym in current:
+        if sym in current_snap:
             already_in.append(sym)
         else:
             to_validate.append(sym)
 
+    valid_syms = []
+    invalid = []
     if to_validate:
+        loop = asyncio.get_running_loop()
         def _check_batch(batch):
-            return list(_executor.map(is_valid_ticker, batch))
+            return list(_fetch_executor.map(is_valid_ticker, batch))
         val_flags = await loop.run_in_executor(_executor, _check_batch, to_validate)
         for sym, is_val in zip(to_validate, val_flags):
             if is_val:
-                current.append(sym)
-                added.append(sym)
+                valid_syms.append(sym)
             else:
                 invalid.append(sym)
-            
-    if added:
-        watchlists[user_id] = current
-        save_user_watchlists(watchlists)
-        
+
+    added = []
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        current = list(watchlists.get(user_id, []))
+        for sym in valid_syms:
+            if len(current) >= _MAX_WATCHLIST_SIZE:
+                break
+            if sym in current:
+                if sym not in already_in:
+                    already_in.append(sym)
+            else:
+                current.append(sym)
+                added.append(sym)
+        if added:
+            watchlists[user_id] = current
+            save_user_watchlists(watchlists)
+
     embed = discord.Embed(
-        title=f"📝 อัปเดต Watchlist ของคุณ ({interaction.user.display_name})",
+        title=f"📝 อัปเดต Watchlist ของคุณ ({display_name})",
         color=0x2ECC71 if added else 0xF1C40F
     )
     if added:
@@ -2617,37 +3210,54 @@ async def slash_add(interaction: discord.Interaction, tickers: str):
         embed.add_field(name="ℹ️ มีอยู่ในลิสต์อยู่แล้ว", value=", ".join([f"`{s}`" for s in already_in]), inline=False)
     if invalid:
         embed.add_field(name="❌ ไม่พบข้อมูลหุ้น (โปรดตรวจตัวสะกด)", value=", ".join([f"`{s}`" for s in invalid]), inline=False)
-        
+
     embed.add_field(
         name=f"📌 ลิสต์ปัจจุบันของคุณ ({len(current)} ตัว)",
         value=", ".join([f"`{s}`" for s in current]) if current else "*ไม่มีหุ้นในลิสต์*",
         inline=False
     )
+    return embed, None
+
+
+def _remove_tickers_for_user(user_id: str, ticker: str) -> tuple[list[str], list[str], list[str]]:
+    raw_list = list(dict.fromkeys([clean_ticker(s) for s in re.split(r'[,;\s]+', ticker) if clean_ticker(s)]))
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        current = list(watchlists.get(user_id, []))
+        removed = []
+        not_found = []
+        for sym in raw_list:
+            if sym in current:
+                current.remove(sym)
+                removed.append(sym)
+            else:
+                not_found.append(sym)
+        if removed:
+            watchlists[user_id] = current
+            save_user_watchlists(watchlists)
+    return removed, not_found, current
+
+
+@bot.tree.command(name="add", description="เพิ่มหุ้นเข้า Watchlist ส่วนตัว (ใส่ได้หลายตัวคั่นด้วยลูกน้ำ เช่น NVDA, AAPL, PLTR)")
+@app_commands.describe(tickers="ชื่อย่อหุ้นที่ต้องการเพิ่ม (คั่นด้วยลูกน้ำหรือเว้นวรรค)")
+async def slash_add(interaction: discord.Interaction, tickers: str):
+    await interaction.response.defer(ephemeral=True)
+    embed, err_msg = await _add_tickers_for_user(
+        str(interaction.user.id),
+        tickers,
+        interaction.user.display_name,
+        "⚠️ กรุณาระบุชื่อย่อหุ้น เช่น `/add AAPL` หรือ `/add NVDA, AMD, PLTR`",
+    )
+    if err_msg:
+        await interaction.followup.send(err_msg, ephemeral=True)
+        return
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="remove", description="ลบหุ้นออกจาก Watchlist ส่วนตัวของคุณ")
 @app_commands.autocomplete(ticker=watchlist_autocomplete)
 @app_commands.describe(ticker="ชื่อหุ้นที่ต้องการลบ (มีแนะนำเฉพาะหุ้นใน Watchlist ของคุณ)")
 async def slash_remove(interaction: discord.Interaction, ticker: str):
-    user_id = str(interaction.user.id)
-    raw_list = [clean_ticker(s) for s in re.split(r'[,;\s]+', ticker) if clean_ticker(s)]
-    
-    watchlists = load_user_watchlists()
-    current = watchlists.get(user_id, [])
-    
-    removed = []
-    not_found = []
-    
-    for sym in raw_list:
-        if sym in current:
-            current.remove(sym)
-            removed.append(sym)
-        else:
-            not_found.append(sym)
-            
-    if removed:
-        watchlists[user_id] = current
-        save_user_watchlists(watchlists)
+    removed, not_found, current = _remove_tickers_for_user(str(interaction.user.id), ticker)
         
     embed = discord.Embed(
         title=f"🗑️ ผลการลบหุ้นออกจาก Watchlist ({interaction.user.display_name})",
@@ -2668,9 +3278,10 @@ async def slash_remove(interaction: discord.Interaction, ticker: str):
 @bot.tree.command(name="clear_watchlist", description="ล้างหุ้นทั้งหมดใน Watchlist ส่วนตัวของคุณให้ว่างเปล่า")
 async def slash_clear_watchlist(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
-    watchlists = load_user_watchlists()
-    watchlists[user_id] = []
-    save_user_watchlists(watchlists)
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        watchlists[user_id] = []
+        save_user_watchlists(watchlists)
     embed = build_watchlist_embed(interaction.user.display_name, [])
     view = WatchlistView(user_id, interaction.user.display_name)
     await interaction.response.send_message(content="🗑️ **ล้าง Watchlist ส่วนตัวของคุณให้ว่างเปล่าเรียบร้อยแล้ว**", embed=embed, view=view, ephemeral=True)
@@ -2690,7 +3301,7 @@ async def slash_scan(interaction: discord.Interaction):
         
     await interaction.response.defer(ephemeral=True)
     loop = asyncio.get_running_loop()
-    embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name)
+    embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, interaction.user.display_name, user_id)
     view = ScanView(user_id, interaction.user.display_name)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
@@ -2698,11 +3309,18 @@ async def slash_scan(interaction: discord.Interaction):
 @app_commands.autocomplete(ticker=ticker_autocomplete)
 @app_commands.describe(ticker="ชื่อย่อหุ้น เช่น NVDA, TSLA, AAPL")
 async def slash_check(interaction: discord.Interaction, ticker: str):
-    await interaction.response.defer()
     user_id = str(interaction.user.id)
     ticker = clean_ticker(ticker)
+    if not ticker:
+        embed, _ = build_check_embed(ticker, user_id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await interaction.response.defer()
     loop = asyncio.get_running_loop()
-    embed, _ = await loop.run_in_executor(_executor, build_check_embed, ticker)
+    embed, ev = await loop.run_in_executor(_executor, build_check_embed, ticker, user_id)
+    if ev is None:
+        await interaction.followup.send(embed=embed)
+        return
     view = CheckView(ticker, user_id)
     await interaction.followup.send(embed=embed, view=view)
 
@@ -2710,9 +3328,12 @@ async def slash_check(interaction: discord.Interaction, ticker: str):
 @app_commands.autocomplete(ticker=ticker_autocomplete)
 @app_commands.describe(ticker="ชื่อย่อหุ้น เช่น NVDA, AAPL")
 async def slash_price(interaction: discord.Interaction, ticker: str):
-    await interaction.response.defer()
     user_id = str(interaction.user.id)
     ticker = clean_ticker(ticker)
+    if not ticker:
+        await interaction.response.send_message(embed=build_price_embed(ticker), ephemeral=True)
+        return
+    await interaction.response.defer()
     loop = asyncio.get_running_loop()
     embed = await loop.run_in_executor(_executor, build_price_embed, ticker)
     view = PriceView(ticker, user_id)
@@ -2722,9 +3343,12 @@ async def slash_price(interaction: discord.Interaction, ticker: str):
 @app_commands.autocomplete(ticker=ticker_autocomplete, period=period_autocomplete)
 @app_commands.describe(ticker="ชื่อย่อหุ้น", period="ช่วงเวลา (5d, 1mo, 3mo, 6mo, 1y)")
 async def slash_history(interaction: discord.Interaction, ticker: str, period: str = "1mo"):
+    ticker = clean_ticker(ticker)
+    if not ticker:
+        await interaction.response.send_message(embed=build_history_embed(ticker, period), ephemeral=True)
+        return
     await interaction.response.defer()
     loop = asyncio.get_running_loop()
-    ticker = clean_ticker(ticker)
     embed = await loop.run_in_executor(_executor, build_history_embed, ticker, period)
     view = HistoryView(ticker, period)
     await interaction.followup.send(embed=embed, view=view)
@@ -2756,29 +3380,66 @@ async def slash_portfolio(interaction: discord.Interaction):
     view = PortfolioView(user_id, interaction.user.display_name)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="port_add", description="เพิ่มหรืออัปเดตหุ้นในพอร์ตโฟลิโอส่วนตัวของคุณ")
+@bot.tree.command(name="port_add", description="เพิ่ม/ทับค่าหุ้น หรือซื้อถัวเฉลี่ยเพิ่มในพอร์ต (คำนวณต้นทุนใหม่และตัดเงินสดอัตโนมัติ)")
 @app_commands.autocomplete(ticker=ticker_autocomplete)
 @app_commands.describe(
-    ticker="ชื่อย่อหุ้น เช่น NVDA, AAPL, VOO",
-    shares="จำนวนหุ้น เช่น 1.5 หรือ 0.55989",
-    avg_cost="ราคาต้นทุนเฉลี่ย USD เช่น 210.50",
+    ticker="ชื่อย่อหุ้น เช่น NVDA, GOOGL, VOO",
+    shares="จำนวนหุ้น (หรือยอดเงินที่ซื้อเพิ่ม หากเลือกโหมดซื้อเพิ่ม THB/USD)",
+    avg_cost="ราคาต้นทุนเฉลี่ย หรือราคาที่เคาะซื้อ USD (ใส่ 0 เพื่อใช้ราคาตลาดปัจจุบัน)",
+    mode="โหมดการบันทึก: ทับค่าเดิม (set) หรือ ซื้อถัวเพิ่มอัตโนมัติ (buy_thb / buy_usd / buy_shares)",
     category="หมวดหมู่ (ไม่บังคับ) เช่น Semiconductor, Core ETF, Big Tech"
 )
-async def slash_port_add(interaction: discord.Interaction, ticker: str, shares: float, avg_cost: float, category: str = "General"):
-    if shares <= 0 or avg_cost < 0:
-        await interaction.response.send_message("❌ กรุณาระบุจำนวนหุ้นมากกว่า 0 และต้นทุนไม่ติดลบ", ephemeral=True)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="📝 ทับค่าเดิม (ระบุจำนวนหุ้นรวม + ต้นทุนเฉลี่ย)", value="set"),
+    app_commands.Choice(name="💸 ซื้อถัวเพิ่มด้วยเงินบาท (ใส่ยอด THB ในช่อง shares)", value="buy_thb"),
+    app_commands.Choice(name="💵 ซื้อถัวเพิ่มด้วยดอลลาร์ (ใส่ยอด USD ในช่อง shares)", value="buy_usd"),
+    app_commands.Choice(name="➕ ซื้อถัวเพิ่มตามจำนวนหุ้น (ใส่หุ้นที่ซื้อเพิ่มในช่อง shares)", value="buy_shares"),
+])
+async def slash_port_add(interaction: discord.Interaction, ticker: str, shares: float, avg_cost: float = 0.0, mode: str = "set", category: str = "General"):
+    sym = clean_ticker(ticker)
+    if not sym or not _is_valid_number(shares) or not _is_valid_number(avg_cost, allow_zero=True):
+        await interaction.response.send_message("❌ กรุณาระบุชื่อหุ้น จำนวนมากกว่า 0 และราคาที่ถูกต้อง", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     user_id = str(interaction.user.id)
-    sym = clean_ticker(ticker)
-    add_user_portfolio_holding(user_id, sym, shares, avg_cost, category)
     loop = asyncio.get_running_loop()
+
+    if avg_cost == 0:
+        item = await loop.run_in_executor(_executor, fetch_ticker_data, sym)
+        if item and item.get("tech") and _is_valid_number(item["tech"].get("price", 0)):
+            avg_cost = float(item["tech"]["price"])
+        else:
+            await interaction.followup.send(f"❌ ไม่สามารถดึงราคาตลาดของ `{sym}` ได้ กรุณาระบุราคา `avg_cost` ด้วยตนเอง", ephemeral=True)
+            return
+
+    p_data = get_user_portfolio_data(user_id) or {}
+    fx_r = float((p_data.get("portfolio_summary") or {}).get("fx_rate_thb") or 33.67)
+    spend_thb = 0.0
+    actual_mode = "set"
+
+    if mode == "buy_thb":
+        spend_thb = shares
+        shares = (spend_thb / fx_r) / avg_cost
+        actual_mode = "buy"
+    elif mode == "buy_usd":
+        spend_thb = round(shares * fx_r, 2)
+        shares = shares / avg_cost
+        actual_mode = "buy"
+    elif mode == "buy_shares":
+        spend_thb = round((shares * avg_cost) * fx_r, 2)
+        actual_mode = "buy"
+
+    if not add_user_portfolio_holding(user_id, sym, shares, avg_cost, category, mode=actual_mode, spend_thb=spend_thb):
+        await interaction.followup.send(f"⚠️ ไม่สามารถบันทึก `{sym}` ได้ (อาจครบเพดาน {_MAX_PORTFOLIO_HOLDINGS} หุ้นในพอร์ตแล้ว)", ephemeral=True)
+        return
     embed = await loop.run_in_executor(_executor, build_portfolio_embed, user_id, interaction.user.display_name, True)
     view = PortfolioView(user_id, interaction.user.display_name)
-    await interaction.followup.send(f"✅ บันทึกหุ้น `{sym}` (จำนวน {shares:g} หุ้น @ ${avg_cost:.2f}) เข้าพอร์ตของคุณเรียบร้อยแล้ว!", embed=embed, view=view, ephemeral=True)
+    msg_txt = f"✅ ซื้อถัวเพิ่ม `{sym}` (+{shares:.5f} หุ้น @ ${avg_cost:.2f}) คำนวณต้นทุนเฉลี่ยใหม่และหักเงินสดเรียบร้อย!" if actual_mode == "buy" else f"✅ บันทึกหุ้น `{sym}` (จำนวน {shares:g} หุ้น @ ${avg_cost:.2f}) เข้าพอร์ตของคุณเรียบร้อยแล้ว!"
+    await interaction.followup.send(msg_txt, embed=embed, view=view, ephemeral=True)
 
 @bot.tree.command(name="port_remove", description="ลบหุ้นออกจากพอร์ตโฟลิโอส่วนตัวของคุณ")
-@app_commands.describe(ticker="ชื่อย่อหุ้นที่ต้องการลบ เช่น NVDA")
+@app_commands.autocomplete(ticker=portfolio_autocomplete)
+@app_commands.describe(ticker="ชื่อย่อหุ้นที่ต้องการลบ (แนะนำจากหุ้นในพอร์ตของคุณ)")
 async def slash_port_remove(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(ephemeral=True)
     user_id = str(interaction.user.id)
@@ -2792,15 +3453,52 @@ async def slash_port_remove(interaction: discord.Interaction, ticker: str):
     view = PortfolioView(user_id, interaction.user.display_name)
     await interaction.followup.send(f"🗑️ ลบหุ้น `{sym}` ออกจากพอร์ตเรียบร้อยแล้ว", embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="port_clear", description="ล้างข้อมูลหุ้นทั้งหมดในพอร์ตโฟลิโอส่วนตัวของคุณ")
-async def slash_port_clear(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+@bot.tree.command(name="port_cash", description="ตั้งค่า เติม หรือถอนยอดเงินสดคงเหลือในพอร์ต (THB)")
+@app_commands.describe(
+    amount="จำนวนเงินบาท (THB)",
+    mode="โหมด: ตั้งยอดใหม่ (set), เติมเงินเพิ่ม (add), ถอน/หักออก (sub)"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="💵 ตั้งยอดเงินสดใหม่ (set)", value="set"),
+    app_commands.Choice(name="➕ เติมเงินสดเพิ่ม (add)", value="add"),
+    app_commands.Choice(name="➖ ถอน/หักเงินสดออก (sub)", value="sub"),
+])
+async def slash_port_cash(interaction: discord.Interaction, amount: float, mode: str = "set"):
     user_id = str(interaction.user.id)
-    clear_user_portfolio(user_id)
+    ok, new_cash = set_user_portfolio_cash(user_id, amount, mode=mode)
+    if not ok:
+        await interaction.response.send_message("❌ กรุณาระบุจำนวนเงินสดเป็นตัวเลขที่ถูกต้อง (ไม่ติดลบ)", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
     loop = asyncio.get_running_loop()
     embed = await loop.run_in_executor(_executor, build_portfolio_embed, user_id, interaction.user.display_name, False)
     view = PortfolioView(user_id, interaction.user.display_name)
-    await interaction.followup.send("🗑️ ล้างข้อมูลพอร์ตโฟลิโอของคุณเรียบร้อยแล้ว", embed=embed, view=view, ephemeral=True)
+    label = {"set": "ตั้งยอดเงินสดใหม่", "add": f"เติมเงินสด +{amount:,.2f} THB", "sub": f"หัก/ถอนเงินสด -{amount:,.2f} THB"}[mode]
+    await interaction.followup.send(f"💵 {label} เรียบร้อย! เงินสดคงเหลือ: **{new_cash:,.2f} THB**", embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="port_clear", description="ล้างข้อมูลหุ้นทั้งหมดในพอร์ตโฟลิโอส่วนตัวของคุณ")
+async def slash_port_clear(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    display_name = interaction.user.display_name
+
+    async def _do_clear(confirm_interaction: discord.Interaction):
+        await confirm_interaction.response.defer(ephemeral=True)
+        clear_user_portfolio(user_id)
+        loop = asyncio.get_running_loop()
+        embed = await loop.run_in_executor(_executor, build_portfolio_embed, user_id, display_name, False)
+        view = PortfolioView(user_id, display_name)
+        await confirm_interaction.edit_original_response(
+            content="🗑️ ล้างข้อมูลพอร์ตโฟลิโอของคุณเรียบร้อยแล้ว",
+            embed=embed,
+            view=view,
+        )
+
+    confirm_view = ConfirmActionView(user_id, _do_clear)
+    await interaction.response.send_message(
+        "⚠️ **ยืนยันการล้างข้อมูลพอร์ตโฟลิโอทั้งหมด?** รายการหุ้นและต้นทุนทั้งหมดในพอร์ตของคุณจะถูกลบ",
+        view=confirm_view,
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="alert_set", description="ตั้งแจ้งเตือนราคาหุ้นเป้าหมาย (แจ้งเตือนผ่าน Discord เมื่อราคาแตะเป้า)")
 @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -2820,8 +3518,8 @@ async def slash_alert_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @bot.tree.command(name="alert_remove", description="ยกเลิกการแจ้งเตือนราคาหุ้น")
-@app_commands.autocomplete(ticker=ticker_autocomplete)
-@app_commands.describe(ticker="ชื่อย่อหุ้นที่ต้องการยกเลิกการแจ้งเตือน เช่น NVDA")
+@app_commands.autocomplete(ticker=alert_autocomplete)
+@app_commands.describe(ticker="ชื่อย่อหุ้นที่ต้องการยกเลิก (แนะนำจากรายการที่คุณตั้งเตือนไว้)")
 async def slash_alert_remove(interaction: discord.Interaction, ticker: str):
     user_id = str(interaction.user.id)
     cnt = remove_user_alert(user_id, ticker)
@@ -2852,10 +3550,11 @@ def build_help_embed():
         name="💼 พอร์ตการลงทุน (Per-User Portfolio)",
         value=(
             "• `/portfolio` - ดูภาพรวมพอร์ตของคุณ (PnL, มูลค่า, สัดส่วน - เป็นส่วนตัว)\n"
-            "• `/port_add <ticker> <shares> <avg_cost> [cat]` - เพิ่ม/อัปเดตหุ้นในพอร์ต\n"
+            "• `/port_add <ticker> <shares> <avg_cost> [cat]` - เพิ่ม/อัปเดตหุ้น หรือซื้อถัวเฉลี่ยในพอร์ต\n"
+            "• `/port_cash <amount> [mode]` - ตั้งค่า เติม หรือถอนยอดเงินสด (THB)\n"
             "• `/port_remove <ticker>` - ลบหุ้นออกจากพอร์ต\n"
-            "• `/port_clear` - ล้างข้อมูลพอร์ตทั้งหมด\n"
-            "• *(หรือกดปุ่ม `[➕ เพิ่ม/แก้หุ้น]` จากเมนูพอร์ต เพื่อกรอกผ่านฟอร์ม)*"
+            "• `/port_clear` - ล้างข้อมูลพอร์ตทั้งหมด (มีปุ่มยืนยัน)\n"
+            "• *(หรือกดปุ่ม `[➕ เพิ่ม/แก้หุ้น]` / `[💵 เงินสด]` จากเมนูพอร์ต)*"
         ),
         inline=False
     )
@@ -2998,12 +3697,32 @@ def build_status_embed():
     embed.set_footer(text="Watchdog Active • ระบบเฝ้าระวังความหน่วงและรีสตาร์ตอัตโนมัติ")
     return embed
 
+async def _is_admin_or_owner(user, guild=None, channel=None) -> bool:
+    if await is_portfolio_owner(user):
+        return True
+    if not (MY_GUILD_ID and guild and getattr(guild, "id", None) == MY_GUILD_ID):
+        return False
+    try:
+        if channel and hasattr(user, "guild_permissions"):
+            if user.guild_permissions.administrator:
+                return True
+        if channel:
+            perms = channel.permissions_for(user)
+            if perms and perms.administrator:
+                return True
+    except Exception:
+        pass
+    return False
+
 class StatusView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="รีสตาร์ตบอททันที", style=discord.ButtonStyle.danger, emoji="🔄", custom_id="status:restart")
     async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _is_admin_or_owner(interaction.user, interaction.guild, interaction.channel):
+            await interaction.response.send_message("⛔ เฉพาะเจ้าของบอทหรือผู้ดูแลระบบ (Admin) เท่านั้นที่สามารถสั่งรีสตาร์ตบอทได้ครับ", ephemeral=True)
+            return
         await interaction.response.send_message("🔄 กำลังรีสตาร์ตบอททันที กรุณารอสักครู่ (ประมาณ 3-5 วินาที)...", ephemeral=True)
         await perform_graceful_restart(f"สั่งรีสตาร์ตผ่านปุ่ม StatusView โดย {interaction.user.display_name}")
 
@@ -3015,6 +3734,9 @@ async def slash_bot_status(interaction: discord.Interaction):
 
 @bot.tree.command(name="restart", description="คำสั่งแอดมิน: สั่งรีสตาร์ตบอท Discord ทันที")
 async def slash_restart(interaction: discord.Interaction):
+    if not await _is_admin_or_owner(interaction.user, interaction.guild, interaction.channel):
+        await interaction.response.send_message("⛔ คำสั่งนี้สงวนไว้สำหรับเจ้าของบอทหรือ Admin เท่านั้นครับ", ephemeral=True)
+        return
     await interaction.response.send_message("🔄 ได้รับคำสั่งรีสตาร์ตบอท กำลังเริ่มการทำงานใหม่ใน 2 วินาที...", ephemeral=True)
     await perform_graceful_restart(f"สั่งรีสตาร์ตผ่าน /restart โดย {interaction.user.display_name}")
 
@@ -3033,6 +3755,9 @@ async def cmd_status(ctx):
 
 @bot.command(name="restart")
 async def cmd_restart(ctx):
+    if not await _is_admin_or_owner(ctx.author, ctx.guild, ctx.channel):
+        await ctx.send("⛔ คำสั่งนี้สงวนไว้สำหรับเจ้าของบอทหรือ Admin เท่านั้นครับ")
+        return
     await ctx.send("🔄 กำลังรีสตาร์ตบอท กรุณารอสักครู่...")
     await perform_graceful_restart(f"สั่งรีสตาร์ตผ่าน !restart โดย {ctx.author.display_name}")
 
@@ -3055,54 +3780,15 @@ async def cmd_add(ctx, *, tickers: str = ""):
     if not tickers:
         await ctx.send("⚠️ กรุณาระบุชื่อหุ้น เช่น `!add TSLA` หรือ `!add AAPL, AMD, PLTR`")
         return
-    user_id = str(ctx.author.id)
-    raw_list = [clean_ticker(s) for s in re.split(r'[,;\s]+', tickers) if clean_ticker(s)]
-    if len(raw_list) > 15:
-        await ctx.send("⚠️ เพื่อความเสถียรของระบบ กรุณาเพิ่มหุ้นไม่เกินครั้งละ 15 ตัวครับ")
+    embed, err_msg = await _add_tickers_for_user(
+        str(ctx.author.id),
+        tickers,
+        ctx.author.display_name,
+        "⚠️ กรุณาระบุชื่อหุ้นที่ถูกต้อง เช่น `!add TSLA` หรือ `!add AAPL, AMD, PLTR`",
+    )
+    if err_msg:
+        await ctx.send(err_msg)
         return
-
-    watchlists = load_user_watchlists()
-    current = watchlists.get(user_id, [])
-    if len(current) >= 50:
-        await ctx.send("⚠️ Watchlist ของคุณมีหุ้นครบ 50 ตัวแล้ว (จำกัดสูงสุด 50 ตัว) กรุณาลบตัวที่ไม่ใช้ออกก่อนครับ")
-        return
-
-    loop = asyncio.get_running_loop()
-    added = []
-    already_in = []
-    invalid = []
-    to_validate = []
-    for sym in raw_list:
-        if len(current) + len(added) + len(to_validate) >= 50:
-            break
-        if sym in current:
-            already_in.append(sym)
-        else:
-            to_validate.append(sym)
-
-    if to_validate:
-        def _check_batch(batch):
-            return list(_executor.map(is_valid_ticker, batch))
-        val_flags = await loop.run_in_executor(_executor, _check_batch, to_validate)
-        for sym, is_val in zip(to_validate, val_flags):
-            if is_val:
-                current.append(sym)
-                added.append(sym)
-            else:
-                invalid.append(sym)
-            
-    if added:
-        watchlists[user_id] = current
-        save_user_watchlists(watchlists)
-        
-    embed = discord.Embed(title=f"📝 อัปเดต Watchlist ของ {ctx.author.display_name}", color=0x2ECC71 if added else 0xF1C40F)
-    if added:
-        embed.add_field(name="✅ เพิ่มสำเร็จ", value=", ".join([f"`{s}`" for s in added]), inline=False)
-    if already_in:
-        embed.add_field(name="ℹ️ มีอยู่แล้ว", value=", ".join([f"`{s}`" for s in already_in]), inline=False)
-    if invalid:
-        embed.add_field(name="❌ ไม่พบข้อมูล", value=", ".join([f"`{s}`" for s in invalid]), inline=False)
-    embed.add_field(name=f"📌 ลิสต์ปัจจุบัน ({len(current)} ตัว)", value=", ".join([f"`{s}`" for s in current]) if current else "*ไม่มีหุ้นในลิสต์*", inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name="remove", aliases=["rm", "del"])
@@ -3110,28 +3796,19 @@ async def cmd_remove(ctx, *, tickers: str = ""):
     if not tickers:
         await ctx.send("⚠️ กรุณาระบุชื่อหุ้น เช่น `!remove TSLA`")
         return
-    user_id = str(ctx.author.id)
-    raw_list = [clean_ticker(s) for s in re.split(r'[,;\s]+', tickers) if clean_ticker(s)]
-    watchlists = load_user_watchlists()
-    current = watchlists.get(user_id, [])
-    
-    removed = [s for s in raw_list if s in current]
-    for s in removed:
-        current.remove(s)
-        
+    removed, _, current = _remove_tickers_for_user(str(ctx.author.id), tickers)
     if removed:
-        watchlists[user_id] = current
-        save_user_watchlists(watchlists)
         await ctx.send(f"🗑️ ลบ `{', '.join(removed)}` ออกจาก Watchlist ส่วนตัวของคุณแล้ว! (คงเหลือ: `{', '.join(current)}`)" if current else f"🗑️ ลบ `{', '.join(removed)}` เรียบร้อย (ขณะนี้ Watchlist ของคุณว่างเปล่า)")
     else:
-        await ctx.send(f"⚠️ ไม่พบหุ้นดังกล่าวใน Watchlist ของคุณ")
+        await ctx.send("⚠️ ไม่พบหุ้นดังกล่าวใน Watchlist ของคุณ")
 
 @bot.command(name="clear", aliases=["reset", "clear_watchlist", "reset_watchlist"])
 async def cmd_clear(ctx):
     user_id = str(ctx.author.id)
-    watchlists = load_user_watchlists()
-    watchlists[user_id] = []
-    save_user_watchlists(watchlists)
+    with _file_lock:
+        watchlists = load_user_watchlists()
+        watchlists[user_id] = []
+        save_user_watchlists(watchlists)
     await ctx.send(f"🗑️ ล้าง Watchlist ส่วนตัวของคุณ ({ctx.author.display_name}) เป็นค่าว่างเปล่าเรียบร้อยแล้ว")
 
 @bot.command(name="scan")
@@ -3145,22 +3822,32 @@ async def cmd_scan(ctx):
         
     async with ctx.typing():
         loop = asyncio.get_running_loop()
-        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, ctx.author.display_name)
+        embed = await loop.run_in_executor(_executor, build_scan_embed, symbols, ctx.author.display_name, user_id)
         view = ScanView(user_id, ctx.author.display_name)
         await ctx.send(embed=embed, view=view)
 
 @bot.command(name="check")
 async def cmd_check(ctx, ticker: str):
     ticker = clean_ticker(ticker)
+    if not ticker:
+        embed, _ = build_check_embed(ticker, str(ctx.author.id))
+        await ctx.send(embed=embed)
+        return
     async with ctx.typing():
         loop = asyncio.get_running_loop()
-        embed, _ = await loop.run_in_executor(_executor, build_check_embed, ticker)
+        embed, ev = await loop.run_in_executor(_executor, build_check_embed, ticker, str(ctx.author.id))
+        if ev is None:
+            await ctx.send(embed=embed)
+            return
         view = CheckView(ticker, str(ctx.author.id))
         await ctx.send(embed=embed, view=view)
 
 @bot.command(name="price")
 async def cmd_price(ctx, ticker: str):
     ticker = clean_ticker(ticker)
+    if not ticker:
+        await ctx.send(embed=build_price_embed(ticker))
+        return
     async with ctx.typing():
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_price_embed, ticker)
@@ -3170,6 +3857,9 @@ async def cmd_price(ctx, ticker: str):
 @bot.command(name="history", aliases=["hist"])
 async def cmd_history(ctx, ticker: str, period: str = "1mo"):
     ticker = clean_ticker(ticker)
+    if not ticker:
+        await ctx.send(embed=build_history_embed(ticker, period))
+        return
     async with ctx.typing():
         loop = asyncio.get_running_loop()
         embed = await loop.run_in_executor(_executor, build_history_embed, ticker, period)
@@ -3205,13 +3895,18 @@ async def cmd_portfolio(ctx, action: str = "", ticker: str = "", shares: str = "
         try:
             sh_val = float(shares.replace(",", ""))
             c_val = float(avg_cost.replace("$", "").replace(",", ""))
-            if sh_val <= 0 or c_val < 0:
+            if not _is_valid_number(sh_val) or not _is_valid_number(c_val, allow_zero=True):
                 raise ValueError()
         except ValueError:
             await ctx.send("❌ กรุณาระบุจำนวนหุ้นและต้นทุนเป็นตัวเลขที่ถูกต้อง เช่น `!port add NVDA 1.5 210.0`")
             return
         sym = clean_ticker(ticker)
-        add_user_portfolio_holding(user_id, sym, sh_val, c_val, category)
+        if not sym:
+            await ctx.send("❌ ชื่อย่อหุ้นไม่ถูกต้อง กรุณาระบุเช่น `NVDA`, `VOO`")
+            return
+        if not add_user_portfolio_holding(user_id, sym, sh_val, c_val, category):
+            await ctx.send(f"⚠️ ไม่สามารถบันทึก `{sym}` ได้ (อาจครบเพดาน {_MAX_PORTFOLIO_HOLDINGS} หุ้นในพอร์ตแล้ว)")
+            return
         try:
             await ctx.message.delete()
         except Exception:
@@ -3246,7 +3941,41 @@ async def cmd_portfolio(ctx, action: str = "", ticker: str = "", shares: str = "
             pass
         return
 
-    # 3. Subcommands: !port clear
+    # 3. Subcommands: !port cash <amount|+add|-sub>
+    if action in ["cash", "thb"]:
+        if not ticker:
+            await ctx.send("⚠️ วิธีใช้: `!port cash <ยอดบาท>` เช่น `!port cash 5000`, `!port cash +2000`, `!port cash -500`")
+            return
+        raw = ticker.strip().replace(",", "").replace("฿", "").upper().replace("THB", "").replace("B", "").strip()
+        c_mode = "set"
+        if raw.startswith("+"):
+            c_mode = "add"
+            raw = raw[1:].strip()
+        elif raw.startswith("-"):
+            c_mode = "sub"
+            raw = raw[1:].strip()
+        try:
+            amt = float(raw)
+        except ValueError:
+            await ctx.send("❌ กรุณาระบุยอดเงินสดเป็นตัวเลขที่ถูกต้อง เช่น `5000` หรือ `+2000`")
+            return
+        ok, new_cash = set_user_portfolio_cash(user_id, amt, mode=c_mode)
+        if not ok:
+            await ctx.send("❌ ยอดเงินสดไม่ถูกต้อง (ต้องเป็นตัวเลขที่ไม่ติดลบ)")
+            return
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        msg = await ctx.send(f"💵 อัปเดตเงินสดพอร์ตของคุณ ({ctx.author.display_name}) เรียบร้อย! คงเหลือ **{new_cash:,.2f} THB**")
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        return
+
+    # 4. Subcommands: !port clear
     if action in ["clear", "reset"]:
         clear_user_portfolio(user_id)
         try:
@@ -3300,12 +4029,14 @@ async def cmd_alert(ctx, action: str = "list", ticker: str = "", target_price: s
             await ctx.send("⚠️ วิธีใช้: `!alert set <ticker> <target_price>` เช่น `!alert set NVDA 250`")
             return
         try:
-            val = float(target_price.replace("$", ""))
+            val = float(target_price.replace("$", "").replace(",", ""))
+            if not _is_valid_number(val):
+                raise ValueError()
             loop = asyncio.get_running_loop()
             ok, msg = await loop.run_in_executor(_executor, add_user_alert, user_id, ctx.channel.id, ticker, val)
             await ctx.send(msg)
         except ValueError:
-            await ctx.send("❌ ราคาเป้าหมายต้องเป็นตัวเลข เช่น `250.50`")
+            await ctx.send("❌ ราคาเป้าหมายต้องเป็นตัวเลขที่มากกว่า 0 เช่น `250.50`")
     elif action in ["remove", "rm", "del", "delete"]:
         if not ticker:
             await ctx.send("⚠️ วิธีใช้: `!alert remove <ticker>` เช่น `!alert remove NVDA`")
@@ -3314,11 +4045,12 @@ async def cmd_alert(ctx, action: str = "list", ticker: str = "", target_price: s
         if cnt > 0:
             await ctx.send(f"🗑️ ลบรายการแจ้งเตือนสำหรับ `{clean_ticker(ticker)}` จำนวน {cnt} รายการเรียบร้อยแล้ว")
         else:
-            await ctx.send(f"⚠️ ไม่พบรายการแจ้งเตือนที่ตรงกับ `{ticker}`")
+            await ctx.send("⚠️ ไม่พบรายการแจ้งเตือนที่ตรงกับคำสั่งของคุณ")
     elif action in ["clear", "reset"]:
-        alerts = load_user_alerts()
-        alerts[user_id] = []
-        save_user_alerts(alerts)
+        with _file_lock:
+            alerts = load_user_alerts()
+            alerts[user_id] = []
+            save_user_alerts(alerts)
         await ctx.send(f"🗑️ ล้างรายการแจ้งเตือนทั้งหมดของคุณ ({ctx.author.display_name}) เรียบร้อยแล้ว")
     else:
         await ctx.send("⚠️ คำสั่งย่อยไม่ถูกต้อง: ใช้ `!alert list`, `!alert set <ticker> <price>`, หรือ `!alert rm <ticker>`")
@@ -3331,9 +4063,7 @@ async def cmd_help(ctx):
 @bot.command(name="sync")
 async def cmd_sync(ctx):
     """คำสั่งแอดมิน: ซิงค์และล้างคำสั่ง Slash Commands ที่ซ้ำซ้อน"""
-    is_admin = ctx.channel.permissions_for(ctx.author).administrator if ctx.guild else False
-    is_owner = await ctx.bot.is_owner(ctx.author)
-    if not (is_admin or is_owner):
+    if not await _is_admin_or_owner(ctx.author, ctx.guild, ctx.channel):
         await ctx.send("⛔ คำสั่งนี้สงวนไว้สำหรับ Admin หรือเจ้าของบอทเท่านั้น")
         return
 
@@ -3345,7 +4075,8 @@ async def cmd_sync(ctx):
         synced = await ctx.bot.tree.sync()
         await msg.edit(content=f"✅ จัดการเรียบร้อย! ขณะนี้มี Global Commands `{len(synced)}` คำสั่ง (ล้างคำสั่งซ้ำในเซิร์ฟเวอร์สำเร็จ)")
     except Exception as e:
-        await msg.edit(content=f"❌ เกิดข้อผิดพลาดในการซิงค์: {e}")
+        print(f"Error in cmd_sync: {type(e).__name__}: {e}", flush=True)
+        await msg.edit(content="❌ เกิดข้อผิดพลาดในการซิงค์คำสั่ง กรุณาดู log ของบอท")
 
 
 async def main():

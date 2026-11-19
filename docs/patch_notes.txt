@@ -1,3 +1,55 @@
+📢 [PATCH NOTES] อัปเดต v2.9.2: ปรับปรุง Quality of Life (QoL), การจัดการเงินสด, Error Handling & Logging ✨
+======================================================================
+
+✨ 1. ปรับปรุง Workflow & UX
+----------------------------------------------------------------------
+• จัดการเงินสดพอร์ตจาก Discord โดยตรง: เพิ่มคำสั่ง `/port_cash <amount> [mode]` (ตั้งยอด/เติม/ถอน), `!port cash <ยอด>` และปุ่ม `[💵 เงินสด]` ในหน้า `/portfolio` พร้อมหน้าต่างกรอกยอด ไม่ต้องเปิดแก้ไฟล์ JSON เอง
+• ป้องกันมือลั่นล้างข้อมูล (`ConfirmActionView`): เพิ่มปุ่มยืนยัน 2 จังหวะ (Confirm/Cancel) ก่อนล้าง Watchlist, แจ้งเตือนราคา และพอร์ตโฟลิโอ พร้อมเช็คสิทธิ์เจ้าของไอดี
+• Autocomplete ตรงบริบท: `/port_remove` แนะนำเฉพาะหุ้นที่มีในพอร์ต, `/alert_remove` แนะนำเฉพาะหุ้นที่ตั้งเตือนไว้ และ `ticker_autocomplete` รวมหุ้นในพอร์ตไว้ด้านบนพร้อมป้ายกำกับ `(💼 ในพอร์ต)`
+
+🛡️ 2. Feedback, Error Handling & Logging
+----------------------------------------------------------------------
+• Global Error Handlers (`discord_bot.py`): เพิ่ม `@bot.tree.error` และ `on_command_error` ตอบกลับข้อความภาษาไทยชัดเจนเมื่อพิมพ์คำสั่งไม่ครบหรือเกิดข้อผิดพลาด โดยไม่เปิดเผย raw exception/stacktrace ให้ผู้ใช้
+• แยกสาเหตุ Error ใน `PortfolioAddModal`: แจ้งแยกชัดเจนระหว่างพิมพ์ราคาไม่ถูกต้อง, ดึงราคาตลาดไม่ได้ หรือรูปแบบยอดซื้อผิด
+• Rotating File Log (`logs/bot.log`): เมื่อรันบอทเบื้องหลังผ่าน `pythonw.exe` จะบันทึกลงไฟล์ `logs/bot.log` (หมุนไฟล์อัตโนมัติ 1 MB x 2) แทนการทิ้งลง `os.devnull` และแสดง error ใน `scan_stocks.py` เมื่อส่ง Toast/Discord ไม่สำเร็จ
+
+⚙️ 3. สคริปต์, การตั้งค่า & เอกสาร
+----------------------------------------------------------------------
+• `scripts/start_bot.bat`: ปิดโปรเซสบอทตัวเก่าก่อนเปิดใหม่ ป้องกันบอทซ้อนตอบเบิ้ล
+• `scripts/run_scan.bat`: ส่งต่อพารามิเตอร์ `%*` ให้ `scan_stocks.py` (เช่น `--phase=prep`)
+• `.env.example`, `.gitignore`, `README.md`, `.github/workflows/daily_scan.yml`: เพิ่มตัวแปร env ที่ขาด, ใส่ `logs/` ใน `.gitignore`, อัปเดตตารางสแกน 3 รอบและ `DISCORD_GUILD_ID` ในคู่มือ, และส่ง `env:` secrets ใน GitHub Actions workflow
+
+✅ 4. ผลการทดสอบ (Verification)
+----------------------------------------------------------------------
+• ผ่าน Unit Tests ครบ 28/28 เคส (`tests/test_bot_enhancements.py`) รวมเทสเงินสด, autocomplete, ปุ่มยืนยัน และ global error handler
+
+
+======================================================================
+📢 [PATCH NOTES] อัปเดต v2.9.1: อุดช่องโหว่ความปลอดภัย & แก้บั๊กเสถียรภาพระบบ 🛡️
+======================================================================
+
+🔒 1. อุดช่องโหว่ความปลอดภัย (Security Hardening)
+----------------------------------------------------------------------
+• Supabase RLS (`scripts/setup_supabase.sql`): ถอด Policy `USING (true)` ที่เปิดกว้างออก จำกัดสิทธิ์ให้ใช้เฉพาะ `service_role` ฝั่งบอท (และ `auth.uid() = user_id` สำหรับผู้ใช้ที่ล็อกอิน)
+• Guild & Admin Check (`discord_bot.py`): เพิ่ม `_tree_interaction_check` ให้ Slash Commands ตรวจ `DISCORD_GUILD_ID` เช่นเดียวกับ Prefix และจำกัดสิทธิ์คำสั่ง `/restart`, `!restart`, `!sync` เฉพาะเจ้าของบอทหรือ Admin ของกิลด์ที่อนุญาตเท่านั้น
+• Input & Injection Validation: กรองชื่อหุ้นใน `clean_ticker` ด้วย Allowlist Regex ป้องกัน mention/markdown/path injection, ป้องกันค่า `NaN`/`Inf` ทำข้อมูล JSON/Supabase พัง และทำความสะอาดค่า `category`
+• Hardcoded Owner ID (`scan_stocks.py`): ลบ Discord User ID ที่ฝังตายตัวออกจาก fallback ของ `save_refreshed_portfolio`
+• Webhook SSRF & HTTPS Validation (`discord_notifier.py`, `discord_bot.py`): บังคับตรวจสอบ URL ของ Discord Webhook (`https://discord.com/api/webhooks/...`) และ Supabase (`https://`) รวมถึงซ่อน raw exception จากผู้ใช้ใน Discord
+• Alert Privacy: ยกเลิกการส่ง fallback ของ Price Alert ไปยังช่องแชตสาธารณะแรกของเซิร์ฟเวอร์เมื่อส่ง DM ไม่สำเร็จ
+
+🛠️ 2. แก้บั๊ก & เพิ่มเสถียรภาพ (Bug Fixes & Stability)
+----------------------------------------------------------------------
+• Race Condition & File I/O: ใช้ `_file_lock` (`RLock`) ครอบการอ่าน-แก้-เขียน Watchlist, Portfolio, Alerts และใช้ `tempfile.NamedTemporaryFile` แทน `.tmp` ชื่อตายตัว ป้องกันข้อมูลทับกันหรือไฟล์ชนกันระหว่างโปรเซส
+• Watchlist & Portfolio Caps: บังคับเพดาน Watchlist (50 ตัว) บนปุ่มลัดหน้า `/check` และ `/price` และจำกัดพอร์ตไม่เกิน 50 ตัวต่อผู้ใช้ รวมถึงเช็คสิทธิ์ในปุ่ม `ScanView` และ Modals
+• Price & History Embeds: กัน `ZeroDivisionError` เมื่อราคาปิดเป็น 0, กรองแถว `NaN` ท้ายตาราง และไม่แนบปุ่ม UI เมื่อชื่อหุ้นไม่ถูกต้อง
+• HTTP Resource Leak & Graceful Restart: ปิด `HTTPError` หลังใช้งาน, เพิ่ม Header ความปลอดภัยให้ Health Check Server และสั่งซิงค์ Supabase ก่อนปิดโปรเซสตอนรีสตาร์ต
+
+✅ 3. ผลการทดสอบ (Verification)
+----------------------------------------------------------------------
+• ผ่าน Unit Tests ครบ 27/27 เคส (`tests/test_bot_enhancements.py`) รวมเทสความปลอดภัยและ edge cases ที่เพิ่มใหม่
+
+
+======================================================================
 📢 [PATCH NOTES] อัปเดต v2.7.0: ยกระดับความเป็นส่วนตัว — กลุ่มคำสั่ง Watchlist แสดงผลเฉพาะคุณ (Private Mode) 🔒
 ======================================================================
 
