@@ -328,105 +328,92 @@ def calculate_technical(df):
     # 8. 20-day Return (%) สำหรับคำนวณ Relative Strength (RS Alpha) เทียบตลาด S&P 500
     ret_20d = float(((curr_price / close.iloc[-21]) - 1.0) * 100.0) if len(close) >= 21 else 0.0
 
-    # Score Technical (Max 20)
+    # Score Technical (Max 20, calibrated to avoid score saturation)
     score = 0
-    # Trend
+    # 1. Core Trend (0 to 6)
     if curr_price > ema20 > ema50:
-        score += 8
+        score += 6
     elif curr_price > ema50:
-        score += 5
+        score += 4
     elif ema200 > 0 and curr_price > ema200:
-        score += 3
+        score += 2
     else:
         # Deep oversold rebound potential
         if rsi < 32:
-            score += 4 # Rebound floor candidate
+            score += 2  # Rebound floor candidate
         else:
-            score += 1
-        
-    # EMA distance penalty / Pullback Zone
+            score += 0
+
+    # 2. EMA Distance / Pullback Timing (-3 to +3)
     if ema_dist > 9.0:
-        score -= 4 # Overextended chase penalty
+        score -= 3  # Overextended chase penalty
     elif -2.0 <= ema_dist <= 3.0:
-        score += 4 # Good entry zone on pullback
+        score += 3  # Good entry zone on pullback
     elif ema_dist < -7.0 and rsi < 32:
-        score += 4 # Extreme oversold pullback zone
+        score += 2  # Extreme oversold pullback zone
     else:
-        score += 2
-        
-    # RSI (All-Weather: Momentum + Value Dip)
+        score += 1
+
+    # 3. RSI Momentum / Mean-Reversion (0 to +3)
     if 50 <= rsi <= 68:
-        score += 4 # Strong momentum sweetspot
-    elif 40 <= rsi < 50:
-        score += 2 # Basing
+        score += 3  # Strong momentum sweetspot
     elif rsi < 30:
-        score += 5 # Deep Oversold Panic Discount
+        score += 3  # Deep Oversold Panic Discount
     elif rsi < 40:
-        score += 3 # Oversold pullback
+        score += 2  # Oversold pullback
+    elif 40 <= rsi < 50:
+        score += 1  # Basing
     elif rsi > 70:
-        score += 1 # Overbought
+        score += 0  # Overbought (no bonus)
     else:
-        score += 2
-        
-    # MACD & Volume
+        score += 1
+
+    # 4. MACD & Volume Confirmation (0 to +2)
     if macd_val > sig_val:
-        score += 2
+        score += 1
     if rvol >= 1.2:
-        score += 2
+        score += 1
 
-    # Bollinger Band Capitulation Bonus
-    if percent_b < 0:
-        score += 2 # Pierced below 2-sigma lower band (Capitulation)
-
-    # Absorption Climax Bonus
-    if absorption_climax:
-        score += 2 # Institutional absorption wick
-
-    # 5. Volume Dry-Up (Minervini VDU Bonus: +2)
-    if volume_dryup:
-        score += 2
-
-    # 6. Minervini Stage 2 Uptrend Bonus (+2)
-    if stage2_uptrend:
-        score += 2
-
-    # 7. Bullish / Bearish RSI Divergence (+2 / -2)
-    if bullish_divergence:
-        score += 2
-    if bearish_divergence:
-        score -= 2
-
-    # 8. Heavy Institutional Distribution Penalty (-2)
-    if distribution_day:
-        score -= 2
-
-    # 9. TTM Volatility Squeeze Bonus (+2 เมื่อบีบตัวพร้อมระเบิดขาขึ้น)
-    if ttm_squeeze:
-        score += 2
-
-    # 10. Bullish Fair Value Gap (FVG Support Bonus: +2)
-    if bullish_fvg:
-        score += 2
-        
-    # 11. AMD Liquidity Sweep Bonus (+3 คะแนน - ดักจับการสับขาหลอกฝั่งขาขึ้น SSL)
-    # ตรรกะ: ราคาแท่งล่าสุดจ้วงหลุด Low 5 วันก่อนหน้า (Sweep Liquidity) แล้วต้องดึงกลับขึ้นมาปิดเหนือ Low เดิมเท่านั้น
-    # (ไส้ล่างยาวอย่างเดียวไม่พอ เพราะหุ้นที่ปิดใต้แนวรับคือ Breakdown ไม่ใช่ Sweep)
+    # 5. AMD / BSL Liquidity Sweeps
     amd_sweep = False
     if len(df) >= 6 and 'Low' in df.columns and 'High' in df.columns:
         prior_5d_low = float(df['Low'].iloc[-6:-1].min())
         if curr_low < prior_5d_low and float(curr_price) > prior_5d_low:
             amd_sweep = True
-            score += 3
 
-    # 12. BSL Liquidity Sweep Penalty (-3 คะแนน - ดักจับการกินสภาพคล่องยอดดอย ห้ามไล่ราคา)
-    # ตรรกะ: ราคาแท่งล่าสุดแทงทะลุ High 5 วันก่อนหน้า แต่โดนเทขายสวนกลับลงมาปิดต่ำกว่า High เดิม
-    # (หุ้นที่ปิดยืนเหนือ High เดิมได้คือ Breakout จริง แม้มีไส้บน)
     bsl_sweep = False
     if len(df) >= 6 and 'Low' in df.columns and 'High' in df.columns:
         prior_5d_high = float(df['High'].iloc[-6:-1].max())
         if curr_high > prior_5d_high and float(curr_price) < prior_5d_high:
             bsl_sweep = True
-            score -= 3
+
+    # 6. Pro Setup Bonuses (capped at +5 so stacked signals don't saturate score to 20)
+    pro_bonus = 0
+    if stage2_uptrend:
+        pro_bonus += 2
+    if volume_dryup:
+        pro_bonus += 1
+    if ttm_squeeze:
+        pro_bonus += 1
+    if bullish_fvg:
+        pro_bonus += 1
+    if bullish_divergence:
+        pro_bonus += 2
+    if absorption_climax:
+        pro_bonus += 2
+    if percent_b < 0:
+        pro_bonus += 1
+    if amd_sweep:
+        pro_bonus += 2
+    score += min(5, pro_bonus)
+
+    # 7. Pro Defensive Penalties (uncapped)
+    if bearish_divergence:
+        score -= 2
+    if distribution_day:
+        score -= 2
+    if bsl_sweep:
+        score -= 3
         
     return {
         'price': float(curr_price),
@@ -477,6 +464,54 @@ def get_session():
     except Exception:
         return None
 
+def classify_macro_regime(spx_curr: float, spx_ema50: float, vix: float, tnx: float, ndx_curr: float = None, ndx_ema50: float = None) -> dict:
+    """4-tier Adaptive Macro Regime classifier using SPX, Nasdaq 100 (breadth), VIX, and 10Y Yield."""
+    spx_above = bool(spx_curr > spx_ema50)
+    ndx_above = bool(ndx_curr > ndx_ema50) if (ndx_curr is not None and ndx_ema50 is not None and ndx_ema50 > 0) else spx_above
+
+    # 1. Base Regime (4 Tiers: Crisis / Risk-Off / Neutral / Bull - Walk-Forward calibrated +2 hurdle)
+    if vix >= 35.0 or (spx_ema50 > 0 and spx_curr < spx_ema50 * 0.95 and vix >= 28.0):
+        regime = "Risk-Off (Crisis / High Volatility)"
+        hurdle = 91
+        macro_score = 4
+    elif not spx_above or vix > 25.0:
+        regime = "Risk-Off (Correction / Caution)"
+        hurdle = 89
+        macro_score = 7
+    elif vix >= 20.0:
+        regime = "Neutral / Consolidation"
+        hurdle = 85
+        macro_score = 11
+    else:
+        regime = "Risk-On (Bull)"
+        hurdle = 82
+        macro_score = 15 if (vix < 16.0 and ndx_above) else 14
+
+    # 2. Interest Rate Pressure (10Y Treasury Yield ^TNX)
+    rate_pressure = "Normal"
+    if tnx >= 5.0:
+        macro_score -= 2
+        hurdle += 2
+        rate_pressure = "High (>=5.0%)"
+    elif tnx >= 4.5:
+        macro_score -= 1
+        hurdle += 1
+        rate_pressure = "Elevated (4.5-5.0%)"
+
+    # 3. Tech/Growth Breadth Divergence (SPX above EMA50 while NDX below EMA50)
+    if spx_above and not ndx_above:
+        macro_score -= 1
+
+    return {
+        'regime': regime,
+        'hurdle': max(75, min(94, hurdle)),
+        'macro_score': max(0, min(15, macro_score)),
+        'spx_above_ema50': spx_above,
+        'ndx_above_ema50': ndx_above,
+        'rate_pressure': rate_pressure,
+    }
+
+
 def analyze_macro():
     session = get_session()
     try:
@@ -484,7 +519,7 @@ def analyze_macro():
         macro_data = yf.download(MACRO_TICKERS, period="3mo", interval="1d", progress=False, **kwargs)
         if macro_data.empty or 'Close' not in macro_data:
             raise ValueError("Empty macro data received from Yahoo Finance")
-            
+
         close = macro_data['Close']
         spx = close['^GSPC'].dropna()
         vix = float(close['^VIX'].dropna().iloc[-1])
@@ -492,33 +527,31 @@ def analyze_macro():
         spx_curr = float(spx.iloc[-1])
         spx_ema50 = float(spx.ewm(span=50, adjust=False).mean().iloc[-1])
         spx_ret_20d = float(((spx_curr / float(spx.iloc[-21])) - 1.0) * 100.0) if len(spx) >= 21 else 0.0
+
+        ndx_curr, ndx_ema50 = None, None
+        if '^NDX' in close and not close['^NDX'].dropna().empty:
+            ndx = close['^NDX'].dropna()
+            ndx_curr = float(ndx.iloc[-1])
+            ndx_ema50 = float(ndx.ewm(span=50, adjust=False).mean().iloc[-1])
+
         fx_thb = 33.67
         if 'THB=X' in close and not close['THB=X'].dropna().empty:
             fx_cand = float(close['THB=X'].dropna().iloc[-1])
             if 25.0 <= fx_cand <= 45.0:
                 fx_thb = round(fx_cand, 2)
-        
-        if spx_curr > spx_ema50 and vix < 20:
-            regime = "Risk-On (Bull)"
-            hurdle = 80
-            macro_score = 14
-        elif spx_curr > spx_ema50 and vix <= 25:
-            regime = "Neutral / Consolidation"
-            hurdle = 83
-            macro_score = 11
-        else:
-            regime = "Risk-Off (Correction / Caution)"
-            hurdle = 88
-            macro_score = 7
-            
+
+        reg = classify_macro_regime(spx_curr, spx_ema50, vix, tnx, ndx_curr, ndx_ema50)
+
         return {
-            'regime': regime,
-            'hurdle': hurdle,
+            'regime': reg['regime'],
+            'hurdle': reg['hurdle'],
             'vix': vix,
             '10y_yield': tnx,
-            'spx_above_ema50': bool(spx_curr > spx_ema50),
+            'spx_above_ema50': reg['spx_above_ema50'],
+            'ndx_above_ema50': reg['ndx_above_ema50'],
+            'rate_pressure': reg['rate_pressure'],
             'spx_ret_20d': round(spx_ret_20d, 2),
-            'macro_score': macro_score,
+            'macro_score': reg['macro_score'],
             'fx_thb': fx_thb
         }
     except Exception as e:
@@ -529,115 +562,199 @@ def analyze_macro():
             'vix': 19.5,
             '10y_yield': 4.15,
             'spx_above_ema50': True,
+            'ndx_above_ema50': True,
+            'rate_pressure': "Normal",
             'spx_ret_20d': 0.0,
             'macro_score': 11,
             'fx_thb': 33.67
         }
 
+def _extract_earnings_days_away(info: dict):
+    """คืนจำนวนวันจนถึงวันประกาศงบถัดไป (int >= 0) หรือ None ถ้าไม่มีข้อมูล"""
+    if not info:
+        return None
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    for key in ("earningsTimestampStart", "earningsTimestamp"):
+        ts = info.get(key)
+        if isinstance(ts, (int, float)) and ts > now_ts - 86400:
+            days = int((ts - now_ts) // 86400)
+            if 0 <= days <= 120:
+                return days
+    return None
+
 def analyze_fundamentals_and_valuation(ticker_obj, is_etf=False, info=None):
+    """Single source of truth for Fundamental (30), Valuation (20), Risk (10), Portfolio Fit (5), and Earnings Risk."""
     if is_etf:
+        category = (info or {}).get('category', 'Index') if info else 'Index'
         return {
+            'is_etf': True,
+            'sector_raw': 'ETF',
+            'industry': category,
             'fund_score': 25,
             'val_score': 16,
             'risk_score': 9,
+            'portfolio_fit': 5,
             'fwd_pe': 'N/A',
             'peg': 'N/A',
-            'rev_growth': 'N/A'
+            'rev_growth': 'N/A',
+            'market_cap': 0,
+            'earnings_days': None,
+            'earnings_soon': False,
         }
-        
+
     if info is None:
         try:
             info = ticker_obj.info or {}
         except Exception:
             info = {}
-            
+
     q_type = str(info.get('quoteType', '')).upper()
     if q_type == 'ETF':
+        category = info.get('category', 'Index')
         return {
+            'is_etf': True,
+            'sector_raw': 'ETF',
+            'industry': category,
             'fund_score': 25,
             'val_score': 16,
             'risk_score': 9,
+            'portfolio_fit': 5,
             'fwd_pe': 'N/A',
             'peg': 'N/A',
-            'rev_growth': 'N/A'
+            'rev_growth': 'N/A',
+            'market_cap': 0,
+            'earnings_days': None,
+            'earnings_soon': False,
         }
 
     sec_raw = info.get('sector', 'US Equities')
-    rev_growth = info.get('revenueGrowth', 0) or 0
-    earnings_growth = info.get('earningsGrowth', 0) or 0
+    industry = info.get('industry', 'Equities')
+    rev_growth = info.get('revenueGrowth', None)
+    earnings_growth = info.get('earningsGrowth', None)
     fwd_pe = info.get('forwardPE', None)
     peg = info.get('pegRatio', None)
     total_debt = info.get('totalDebt', 0) or 0
-    fcf = info.get('freeCashflow', 0) or 0
-    pm = info.get('profitMargins', 0) or 0
-    roe = info.get('returnOnEquity', 0) or 0
-    
-    # 1. Fundamental Score (Max 30) - Sector Adaptive
-    fund_score = 15 # base
+    fcf = info.get('freeCashflow', None)
+    pm = info.get('profitMargins', None)
+    roe = info.get('returnOnEquity', None)
+    mcap = info.get('marketCap', 0) or 0
+
+    rev_g = float(rev_growth) if rev_growth is not None else 0.0
+    earn_g = float(earnings_growth) if earnings_growth is not None else 0.0
+    pm_v = float(pm) if pm is not None else 0.0
+    roe_v = float(roe) if roe is not None else 0.0
+    missing_all_fund = (rev_growth is None and earnings_growth is None and pm is None and roe is None)
+
+    # 1. Fundamental Score (Max 30) - Sector Adaptive + Profitability & Negative-Growth Penalties
+    fund_score = 12  # calibrated base (prevents weak/missing data from scoring 15+ free)
     if sec_raw == 'Financial Services':
-        if roe > 0.15: fund_score += 8
-        elif roe > 0.10: fund_score += 4
-        if pm > 0.20: fund_score += 7
-        elif pm > 0.10: fund_score += 4
+        if roe_v > 0.15: fund_score += 8
+        elif roe_v > 0.10: fund_score += 4
+        elif roe is not None and roe_v < 0.05: fund_score -= 3
+        if pm_v > 0.20: fund_score += 7
+        elif pm_v > 0.10: fund_score += 4
+        elif pm is not None and pm_v < 0: fund_score -= 4
+        if rev_g > 0.05: fund_score += 3
+        elif rev_g < -0.05: fund_score -= 2
     elif sec_raw in ['Consumer Defensive', 'Utilities', 'Healthcare']:
-        if rev_growth > 0.10: fund_score += 6
-        elif rev_growth > 0.04: fund_score += 4
-        if earnings_growth > 0.10: fund_score += 6
-        elif earnings_growth > 0.05: fund_score += 3
-        if roe > 0.15: fund_score += 3
+        if rev_g > 0.10: fund_score += 6
+        elif rev_g > 0.04: fund_score += 4
+        elif rev_g < -0.03: fund_score -= 3
+        if earn_g > 0.10: fund_score += 6
+        elif earn_g > 0.05: fund_score += 3
+        elif earn_g < -0.05: fund_score -= 3
+        if roe_v > 0.15: fund_score += 3
+        if pm_v > 0.12: fund_score += 3
+        elif pm is not None and pm_v < 0: fund_score -= 4
     else:
-        if rev_growth > 0.20:
-            fund_score += 7
-        elif rev_growth > 0.10:
-            fund_score += 4
-        elif rev_growth > 0:
-            fund_score += 2
-            
-        if earnings_growth > 0.20:
-            fund_score += 8
-        elif earnings_growth > 0.10:
-            fund_score += 4
-        
+        # Tech, Consumer Cyclical, Industrials, Energy, Materials
+        if rev_g > 0.20: fund_score += 7
+        elif rev_g > 0.10: fund_score += 4
+        elif rev_g > 0: fund_score += 2
+        elif rev_g < -0.05: fund_score -= 4
+        elif rev_g < 0: fund_score -= 2
+
+        if earn_g > 0.20: fund_score += 7
+        elif earn_g > 0.10: fund_score += 4
+        elif earn_g > 0: fund_score += 1
+        elif earn_g < -0.10: fund_score -= 4
+        elif earn_g < 0: fund_score -= 2
+
+        # Profitability & capital efficiency check
+        if pm_v > 0.20: fund_score += 4
+        elif pm_v > 0.10: fund_score += 2
+        elif pm is not None and pm_v < 0: fund_score -= 4
+        if roe_v > 0.20 and pm_v > 0: fund_score += 2
+
+    if missing_all_fund:
+        fund_score = min(fund_score, 12)
     fund_score = max(0, min(30, fund_score))
-    
-    # 2. Valuation Score (Max 20) - Sector Adaptive Benchmarks
-    val_score = 10 # base
-    if peg is not None and peg > 0:
-        if peg < 1.5:
-            val_score += 8
-        elif peg <= 2.2:
-            val_score += 5
-        elif peg > 3.0:
-            val_score -= 3
+
+    # 2. Valuation Score (Max 20) - Sector Adaptive Benchmarks + Extreme P/E Sanity Check
+    val_score = 9  # calibrated base
+    pe_bench = 18 if sec_raw in ['Financial Services', 'Energy'] else (28 if sec_raw in ['Consumer Defensive', 'Utilities'] else 35)
+    if peg is not None and 0 < peg < 100:
+        if peg < 1.2: val_score += 9
+        elif peg < 1.6: val_score += 7
+        elif peg <= 2.2: val_score += 4
+        elif peg > 3.5: val_score -= 4
+        elif peg > 2.8: val_score -= 2
+        # Cross-check extreme Forward P/E even if PEG looks low
+        if fwd_pe is not None and fwd_pe > pe_bench * 1.8:
+            val_score -= 2
     elif fwd_pe is not None and fwd_pe > 0:
-        pe_bench = 18 if sec_raw in ['Financial Services', 'Energy'] else (28 if sec_raw in ['Consumer Defensive', 'Utilities'] else 35)
-        if fwd_pe < pe_bench * 0.8:
-            val_score += 7 if sec_raw in ['Financial Services', 'Energy', 'Consumer Defensive', 'Utilities'] else 6
-        elif fwd_pe <= pe_bench * 1.0:
-            val_score += 3
-        elif fwd_pe > pe_bench * 1.5:
-            val_score -= 3
+        if fwd_pe < pe_bench * 0.75: val_score += 8
+        elif fwd_pe < pe_bench * 0.95: val_score += 5
+        elif fwd_pe <= pe_bench * 1.15: val_score += 2
+        elif fwd_pe > pe_bench * 1.6: val_score -= 4
+        elif fwd_pe > pe_bench * 1.35: val_score -= 2
+    elif fwd_pe is not None and fwd_pe < 0:
+        val_score -= 4  # Negative forward earnings
     val_score = max(0, min(20, val_score))
-    
-    # 3. Debt & Balance sheet (Max 10)
-    risk_score = 7
+
+    # 3. Debt & Balance Sheet Risk Score (Max 10) - Penalizes Negative FCF (Cash Burn)
+    risk_score = 6
     if sec_raw == 'Financial Services':
-        risk_score = 9 if roe > 0.12 else 7
-    elif fcf > 0:
-        debt_fcf = total_debt / (fcf + 1e-9)
-        if debt_fcf < 2.5:
-            risk_score += 3
-        elif debt_fcf > 5.0:
-            risk_score -= 3
+        if roe_v > 0.12: risk_score = 9
+        elif roe_v > 0.06: risk_score = 7
+        elif roe is not None and roe_v <= 0: risk_score = 3
+    elif fcf is not None:
+        if fcf > 0:
+            debt_fcf = total_debt / (fcf + 1e-9)
+            if debt_fcf < 2.0: risk_score += 4
+            elif debt_fcf < 3.5: risk_score += 2
+            elif debt_fcf > 6.0: risk_score -= 3
+            elif debt_fcf > 4.5: risk_score -= 1
+        elif fcf < 0:
+            # Cash-burning company
+            risk_score = 2 if total_debt > 0 else 3
     risk_score = max(0, min(10, risk_score))
-    
+
+    # 4. Portfolio Fit (Max 5) - Scale & Moat Stability
+    if mcap > 200e9:
+        fit = 5
+    elif mcap > 50e9:
+        fit = 4
+    else:
+        fit = 3
+
+    earnings_days = _extract_earnings_days_away(info)
+    earnings_soon = bool(earnings_days is not None and earnings_days <= 7)
+
     return {
+        'is_etf': False,
+        'sector_raw': sec_raw,
+        'industry': industry,
         'fund_score': fund_score,
         'val_score': val_score,
         'risk_score': risk_score,
+        'portfolio_fit': fit,
         'fwd_pe': round(fwd_pe, 1) if fwd_pe else 'N/A',
         'peg': round(peg, 2) if peg else 'N/A',
-        'rev_growth': f"{round(rev_growth*100, 1)}%" if rev_growth else 'N/A'
+        'rev_growth': f"{round(rev_g*100, 1)}%" if rev_growth is not None else 'N/A',
+        'market_cap': mcap,
+        'earnings_days': earnings_days,
+        'earnings_soon': earnings_soon,
     }
 
 def apply_relative_strength(tech, macro):
@@ -684,12 +801,14 @@ def compute_position_size(price, stop_loss, cash_thb, portfolio_value_usd=0.0, f
 
     # 1%-2% Portfolio Equity Risk Cap (ถ้ารู้มูลค่าพอร์ตรวม)
     port_thb = max(0.0, float(portfolio_value_usd or 0.0) * fx) + cash
-    if "Risk-Off" in str(regime):
-        risk_pct = 0.01   # ตลาด Risk-Off คุมความเสี่ยงต่อไม้ไม่เกิน 1.0% ของพอร์ต
+    if "Crisis" in str(regime):
+        risk_pct = 0.0075  # ตลาดวิกฤต (VIX >= 35) คุมความเสี่ยงเข้มสุด 0.75% ต่อไม้
+    elif "Risk-Off" in str(regime):
+        risk_pct = 0.01    # ตลาด Risk-Off คุมความเสี่ยงต่อไม้ไม่เกิน 1.0% ของพอร์ต
     elif "Bull" in str(regime):
-        risk_pct = 0.02   # ตลาด Bull อนุญาตความเสี่ยงต่อไม้ 2.0%
+        risk_pct = 0.02    # ตลาด Bull อนุญาตความเสี่ยงต่อไม้ 2.0%
     else:
-        risk_pct = 0.015  # ตลาด Neutral คุมความเสี่ยง 1.5%
+        risk_pct = 0.015   # ตลาด Neutral คุมความเสี่ยง 1.5%
 
     if port_thb > cash and port_thb > 5000:
         risk_budget_thb = max(port_thb * risk_pct, cash * 0.15 * stop_pct)
@@ -733,11 +852,11 @@ def compute_entry_zone(tech):
     chandelier_stop = float(tech.get('chandelier_stop') or max(0.0, price - (2.5 * atr)))
 
     if -2.0 <= ema_dist <= 2.5:
-        # Tier 1: In Sweetspot (near EMA20)
+        # Tier 1: In Sweetspot (near EMA20) - 2.2x ATR stop gives breathing room against normal US equity noise
         buy_low = ema20 * 0.985
         buy_high = ema20 * 1.02
-        stop_loss = max(ema50 * 0.95, price - (1.5 * atr))
-        target_price = price + (2.5 * atr)
+        stop_loss = min(ema50 * 0.97, price - (2.2 * atr)) if ema50 < price else (price - (2.2 * atr))
+        target_price = price + (3.5 * atr)
         zone_type = "ใกล้เส้น EMA20 + 🧲FVG" if tech.get('bullish_fvg') else "ใกล้เส้น EMA20"
         entry_status = "🟢 อยู่ในโซนซื้อเหมาะสม (In Sweetspot)"
         entry_advice = "ราคาอยู่ในโซนย่อตัวที่ได้เปรียบต้นทุน เข้าซื้อสะสมได้ทันที"
@@ -747,8 +866,8 @@ def compute_entry_zone(tech):
         # Tier 1: Extended
         buy_low = ema20 * 0.985
         buy_high = ema20 * 1.02
-        stop_loss = max(ema50 * 0.95, ema20 - (1.5 * atr))
-        target_price = price + (2.0 * atr)
+        stop_loss = min(ema50 * 0.97, ema20 - (2.0 * atr)) if ema50 < ema20 else (ema20 - (2.0 * atr))
+        target_price = price + (3.0 * atr)
         zone_type = "เป้าหมายย่อตัว EMA20"
         entry_status = f"🟡 วิ่งเกินจุดซื้อ (+{ema_dist:.1f}%) รอจังหวะย่อ"
         entry_advice = f"ราคาไล่ขึ้นสูง แนะนำรอราคาย่อตัวกลับมาที่ ${buy_low:.2f} - ${buy_high:.2f}"
@@ -760,8 +879,8 @@ def compute_entry_zone(tech):
             # Tier 2: Testing EMA50 Intermediate Support
             buy_low = ema50 * 0.985
             buy_high = ema50 * 1.015
-            stop_loss = max(ema50 * 0.93, price - (1.5 * atr))
-            target_price = max(ema20 + (1.5 * atr), price + (2.0 * atr))
+            stop_loss = min(ema50 * 0.94, price - (2.2 * atr))
+            target_price = max(ema20 + (2.0 * atr), price + (3.2 * atr))
             zone_type = "แนวรับ EMA50"
             entry_status = f"🟠 พักฐานลึก ({ema_dist:.1f}%) รอตั้งรับ EMA50"
             entry_advice = f"ราคาหลุด EMA20 กลายเป็นแนวต้าน แนะนำชะลอซื้อและรอดูแรงรับที่โซน EMA50 (${buy_low:.2f} - ${buy_high:.2f})"
@@ -771,8 +890,8 @@ def compute_entry_zone(tech):
             # Tier 3: Testing EMA200 Long-term Support
             buy_low = ema200 * 0.985
             buy_high = ema200 * 1.015
-            stop_loss = max(ema200 * 0.93, price - (1.5 * atr))
-            target_price = max(ema50 + (1.5 * atr), price + (2.0 * atr))
+            stop_loss = min(ema200 * 0.94, price - (2.2 * atr))
+            target_price = max(ema50 + (2.0 * atr), price + (3.2 * atr))
             zone_type = "แนวรับใหญ่ EMA200"
             entry_status = f"🔴 หลุดแนวรับ EMA50 ({ema_dist:.1f}%) รอรับ EMA200"
             entry_advice = f"ราคาหลุดทั้ง EMA20 และ EMA50 แนวโน้มระยะกลางเสียทรง แนะนำชะลอซื้อ รอดูแรงรับที่แนวรับใหญ่ EMA200 (${buy_low:.2f} - ${buy_high:.2f})"
@@ -782,12 +901,12 @@ def compute_entry_zone(tech):
             # Tier 4: Major breakdown below EMA200
             buy_low = price * 0.92
             buy_high = price * 0.96
-            stop_loss = price - (2.0 * atr)
-            # หากมีสัญญาณ Capitulation / Bullish Divergence เป้าหมายรีบาวด์คือดึงกลับหา EMA20 (2.5x ATR)
+            stop_loss = price - (2.5 * atr)
+            # หากมีสัญญาณ Capitulation / Bullish Divergence เป้าหมายรีบาวด์คือดึงกลับหา EMA20 (3.5x ATR)
             if tech.get('absorption_climax') or tech.get('bullish_divergence') or tech.get('rsi', 50) < 32:
-                target_price = price + (2.5 * atr)
+                target_price = price + (3.5 * atr)
             else:
-                target_price = price + (2.0 * atr)
+                target_price = price + (3.0 * atr)
             zone_type = "ชะลอซื้อ รอสร้างฐาน"
             entry_status = "🔴 เสียทรงขาลง (Breakdown)"
             entry_advice = "ราคาหลุดแนวรับสำคัญทุกเส้น แนะนำพักการลงทุน (Wait) รอราคาหยุดลงและสร้างฐานใหม่"
@@ -798,6 +917,12 @@ def compute_entry_zone(tech):
     if tech.get('bsl_sweep'):
         entry_status = "⚠️ ระวังติดดอย (เกิด BSL Sweep ชนยอดดอย ห้ามไล่ราคา)"
         entry_advice = "ตรวจพบแรงเทขายกดทับหลังแทงทะลุ High 5 วัน (Liquidity Sweep) เสี่ยงพักฐานทันที ห้ามไล่ราคาเด็ดขาด"
+
+    # Guarantee stop_loss is strictly below price and capped within realistic swing bounds (-15% floor)
+    if price > 0:
+        max_valid_stop = max(0.01, price - max(1.2 * atr, price * 0.02))
+        min_valid_stop = max(0.01, price * 0.85)
+        stop_loss = max(min_valid_stop, min(stop_loss, max_valid_stop))
 
     risk = max(price - stop_loss, 0.01)
     reward = max(target_price - price, 0.01)
@@ -854,22 +979,29 @@ def decide_action(ticker_sym, total_score, tech, fund_val, macro, is_etf, semi_e
     price = tech.get('price', 0)
     ema50 = tech.get('ema50', 0)
     ema200 = tech.get('ema200', 0)
+    is_momentum_leader = bool(tech.get('stage2_uptrend') and tech.get('rs_leader'))
+    max_ema_dist = 10.0 if is_momentum_leader else 8.0
+    max_rsi = 75.0 if is_momentum_leader else 70.0
 
     # PORTFOLIO OVERRIDE RULE (กลุ่มชิปเกินเพดาน)
     if ticker_sym in SEMI_TICKERS and semi_exposure is not None and semi_exposure >= TRUE_SEMI_CAP:
         final_action, override_reason = "HOLD", f"กลุ่มชิปเกินเพดาน {TRUE_SEMI_CAP * 100:.0f}%"
+    # EARNINGS BLACKOUT GUARD (เกมรับ: เลี่ยงเปิดไม้เต็มก่อนประกาศงบ <= 5 วัน ป้องกันความเสี่ยง Gap ข้ามคืน)
+    elif (not is_etf and fund_val.get('earnings_days') is not None
+          and 0 <= int(fund_val['earnings_days']) <= 5):
+        final_action, override_reason = "HOLD", f"ใกล้ประกาศงบใน {int(fund_val['earnings_days'])} วัน (เลี่ยงความเสี่ยง Gap ข้ามคืน)"
     # BSL FAKEOUT OVERRIDE (ห้ามซื้อหุ้นที่กำลังติดกับดัก BSL Sweep)
     elif tech.get('bsl_sweep', False):
         final_action, override_reason = "WAIT", "เกิด BSL Sweep (ติดกับดักราคายอดดอย ห้ามไล่ราคา)"
     # BEARISH RSI DIVERGENCE OVERRIDE (เกมรับ: ราคาทำ High ใหม่แต่ RSI แผ่วลง ห้ามไล่ซื้อ)
     elif tech.get('bearish_divergence', False):
         final_action, override_reason = "HOLD", "เกิด Bearish RSI Divergence (ราคาทำ High ใหม่แต่โมเมนตัมแผ่ว)"
-    # OVEREXTENSION FILTER (ห้ามไล่ราคาเมื่อราคาวิ่งฉีกห่าง EMA20 เกิน 8%)
-    elif tech.get('ema_dist', 0) > 8.0:
-        final_action, override_reason = "WAIT", f"ราคา Overextended ห่าง EMA20 +{tech.get('ema_dist', 0):.1f}% (เสี่ยงไล่ราคาดอย)"
-    # RSI OVERBOUGHT FILTER (ห้ามซื้อเมื่อ RSI เข้าเขต Overbought >= 70)
-    elif rsi >= 70:
-        final_action, override_reason = "HOLD", f"RSI Overbought ({rsi:.1f} >= 70 เสี่ยงย่อพักฐาน)"
+    # OVEREXTENSION FILTER (ผ่อนผันถึง 10% เฉพาะ Stage 2 + RS Leader)
+    elif tech.get('ema_dist', 0) > max_ema_dist:
+        final_action, override_reason = "WAIT", f"ราคา Overextended ห่าง EMA20 +{tech.get('ema_dist', 0):.1f}% (เกินเกณฑ์ {max_ema_dist:.0f}%)"
+    # RSI OVERBOUGHT FILTER (ผ่อนผันถึง 75 เฉพาะ Stage 2 + RS Leader)
+    elif rsi >= max_rsi:
+        final_action, override_reason = "HOLD", f"RSI Overbought ({rsi:.1f} >= {max_rsi:.0f} เสี่ยงย่อพักฐาน)"
     # DOWNTREND DEFENSE FILTER (ห้ามรับมีดเมื่อราคาอยู่ต่ำกว่าทั้ง EMA50 และ EMA200)
     # ข้ามเมื่อไม่มีข้อมูล EMA200 (ema200 <= 0), Core ETF, Absorption Climax หรือ RSI < 28
     elif (ema200 > 0 and price < ema50 and price < ema200
@@ -903,14 +1035,10 @@ def main():
         apply_relative_strength(tech, macro)
         fund_val = analyze_fundamentals_and_valuation(t, is_etf=is_etf)
         
-        # Portfolio fit score (Max 5)
-        # If semiconductor, penalty for high existing weight
-        if ticker_sym in SEMI_TICKERS:
-            portfolio_fit = 1 # penalized due to 46% concentration
-        elif ticker_sym in ['VOO', 'GOOGL', 'MSFT']:
-            portfolio_fit = 5 # great diversification
-        else:
-            portfolio_fit = 3
+        # Portfolio fit score (Max 5) - unified with discord_bot (Market Cap + dynamic Semi cap penalty)
+        portfolio_fit = fund_val.get('portfolio_fit', 3)
+        if ticker_sym in SEMI_TICKERS and DIRECT_SEMI_EXPOSURE >= TRUE_SEMI_CAP:
+            portfolio_fit = 1  # penalized only when semi exposure actually hits cap
             
         total_score = (
             fund_val['fund_score'] + 
@@ -1084,19 +1212,19 @@ def determine_scan_phase() -> str:
             v = arg.split("=", 1)[1].lower().strip()
             if any(x in v for x in ("07", "morn", "sum")): return "morning"
             if any(x in v for x in ("20", "prep", "plan")): return "prep"
-            if any(x in v for x in ("23", "trade", "exec")): return "trading"
+            if any(x in v for x in ("23", "trad", "exec")): return "trading"
     for i, arg in enumerate(sys.argv):
         if arg == "--phase" and i + 1 < len(sys.argv):
             v = sys.argv[i + 1].lower().strip()
             if any(x in v for x in ("07", "morn", "sum")): return "morning"
             if any(x in v for x in ("20", "prep", "plan")): return "prep"
-            if any(x in v for x in ("23", "trade", "exec")): return "trading"
+            if any(x in v for x in ("23", "trad", "exec")): return "trading"
 
     env_v = os.getenv("SCAN_PHASE", "").lower().strip()
     if env_v:
         if any(x in env_v for x in ("07", "morn", "sum")): return "morning"
         if any(x in env_v for x in ("20", "prep", "plan")): return "prep"
-        if any(x in env_v for x in ("23", "trade", "exec")): return "trading"
+        if any(x in env_v for x in ("23", "trad", "exec")): return "trading"
 
     now_th = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)
     hour = now_th.hour

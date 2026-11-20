@@ -670,11 +670,17 @@ class TestLogicFixes(unittest.TestCase):
         # 6. Discord notifier 429 retry logic
         calls = []
         def fake_urlopen(req, timeout=10):
+            url = getattr(req, "full_url", str(req))
+            if "discord.com" not in url:
+                resp = MagicMock()
+                resp.read.return_value = b"{}"
+                resp.__enter__.return_value = resp
+                return resp
             calls.append(1)
             if len(calls) == 1:
                 fp = MagicMock()
                 fp.read.return_value = b'{"retry_after": 0.01}'
-                raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, fp)
+                raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, fp)
             resp = MagicMock()
             resp.read.return_value = b'{"id": "chan_1"}'
             resp.__enter__.return_value = resp
@@ -848,6 +854,92 @@ class TestLogicFixes(unittest.TestCase):
             a = discord_bot.load_user_alerts()
             a.pop(test_uid, None)
             discord_bot._write_json_local_only(discord_bot.USER_ALERT_FILE, a)
+
+    def test_quant_v210_regime_flexibility_and_scoring_accuracy(self):
+        """Tests for v2.10.0 Quant Engine: 4-tier macro, stop_loss invariant, negative-FCF/loss penalties, earnings blackout, unified scoring"""
+        import scan_stocks
+        # 1. Stop loss must ALWAYS be strictly below price (no distorted R:R when ema50 > price)
+        tech_ema50_above = {
+            "price": 100.0,
+            "ema20": 101.0,
+            "ema50": 110.0,  # ema50 * 0.95 = 104.5 > price!
+            "ema200": 95.0,
+            "ema_dist": -1.0,
+            "atr": 2.0,
+        }
+        ent = scan_stocks.compute_entry_zone(tech_ema50_above)
+        self.assertLess(ent["stop_loss"], 100.0)
+        self.assertLess(ent["rr_ratio"], 20.0)
+
+        # 2. 4-tier Adaptive Macro Regime + 10Y Yield Pressure + Nasdaq Divergence
+        bull = scan_stocks.classify_macro_regime(5500, 5300, vix=14.0, tnx=4.1, ndx_curr=19500, ndx_ema50=18800)
+        self.assertEqual(bull["regime"], "Risk-On (Bull)")
+        self.assertEqual(bull["macro_score"], 15)
+        self.assertEqual(bull["hurdle"], 82)
+
+        # High 10Y yield pressure (>= 5.0%) reduces macro_score & raises hurdle
+        bull_high_rate = scan_stocks.classify_macro_regime(5500, 5300, vix=14.0, tnx=5.1, ndx_curr=19500, ndx_ema50=18800)
+        self.assertEqual(bull_high_rate["macro_score"], 13)
+        self.assertEqual(bull_high_rate["hurdle"], 84)
+
+        # Nasdaq divergence trims macro_score
+        bull_div = scan_stocks.classify_macro_regime(5500, 5300, vix=14.0, tnx=4.1, ndx_curr=18000, ndx_ema50=18800)
+        self.assertLess(bull_div["macro_score"], bull["macro_score"])
+
+        # Crisis regime (VIX >= 35)
+        crisis = scan_stocks.classify_macro_regime(4800, 5200, vix=38.0, tnx=4.2)
+        self.assertIn("Crisis", crisis["regime"])
+        self.assertEqual(crisis["macro_score"], 4)
+        self.assertGreaterEqual(crisis["hurdle"], 90)
+
+        # Crisis position sizing uses tighter 0.75% risk cap than Bull (2.0%)
+        pos_crisis = scan_stocks.compute_position_size(100.0, 90.0, 20000.0, portfolio_value_usd=500.0, fx_thb=34.0, regime=crisis["regime"])
+        pos_bull = scan_stocks.compute_position_size(100.0, 90.0, 20000.0, portfolio_value_usd=500.0, fx_thb=34.0, regime=bull["regime"])
+        self.assertLess(pos_crisis["recommended_thb"], pos_bull["recommended_thb"])
+
+        # 3. Unprofitable / Cash-burning company is penalized (no free 32/60)
+        bad_info = {
+            "sector": "Technology",
+            "revenueGrowth": -0.15,
+            "earningsGrowth": -0.40,
+            "profitMargins": -0.25,
+            "returnOnEquity": -0.10,
+            "forwardPE": -12.0,
+            "freeCashflow": -500_000_000,
+            "totalDebt": 2_000_000_000,
+            "marketCap": 5_000_000_000,
+        }
+        bad_fv = scan_stocks.analyze_fundamentals_and_valuation(None, is_etf=False, info=bad_info)
+        self.assertLessEqual(bad_fv["fund_score"], 5)
+        self.assertLessEqual(bad_fv["val_score"], 5)
+        self.assertLessEqual(bad_fv["risk_score"], 3)
+
+        # 4. Unified scoring between scan_stocks and discord_bot (zero drift)
+        good_info = {
+            "sector": "Technology",
+            "revenueGrowth": 0.28,
+            "earningsGrowth": 0.35,
+            "profitMargins": 0.32,
+            "returnOnEquity": 0.40,
+            "pegRatio": 1.1,
+            "forwardPE": 28.0,
+            "freeCashflow": 50_000_000_000,
+            "totalDebt": 20_000_000_000,
+            "marketCap": 2_000_000_000_000,
+        }
+        fv_scan = scan_stocks.analyze_fundamentals_and_valuation(None, is_etf=False, info=good_info)
+        fv_bot = discord_bot.analyze_all_around_fundamentals(None, is_etf=False, info=good_info)
+        for k in ("fund_score", "val_score", "risk_score", "portfolio_fit"):
+            self.assertEqual(fv_scan[k], fv_bot[k], f"Mismatch on {k} between scanner and bot")
+
+        # 5. Earnings Blackout Guard (<= 5 days downgrades BUY -> HOLD for stocks, not ETF)
+        tech_ok = {"price": 150.0, "ema20": 149.0, "ema50": 140.0, "ema200": 120.0, "ema_dist": 0.6, "rsi": 55.0, "atr": 3.0}
+        fv_earn = {**fv_scan, "earnings_days": 3, "earnings_soon": True}
+        _, raw_a, final_a, ov, reason = scan_stocks.decide_action("NVDA", 90, tech_ok, fv_earn, bull, is_etf=False)
+        self.assertEqual(raw_a, "BUY")
+        self.assertEqual(final_a, "HOLD")
+        self.assertTrue(ov)
+        self.assertIn("งบ", reason)
 
 if __name__ == '__main__':
     unittest.main()

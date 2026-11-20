@@ -125,7 +125,8 @@ except Exception:
 
 from scan_stocks import (
     MACRO_TICKERS, SEMI_TICKERS, TRUE_SEMI_CAP,
-    calculate_technical, analyze_macro,
+    calculate_technical, analyze_macro, classify_macro_regime,
+    analyze_fundamentals_and_valuation,
     get_session, decide_action, compute_entry_zone,
     apply_relative_strength, compute_position_size,
     _parse_iso_ts
@@ -1078,135 +1079,16 @@ def is_valid_ticker(ticker_sym):
     except Exception:
         return False
 
-# Sector-Adaptive Fundamental & Valuation Evaluator (All-Around US Equities & ETFs)
+# Sector-Adaptive Fundamental & Valuation Evaluator (delegates to scan_stocks single source of truth)
 def analyze_all_around_fundamentals(ticker_obj, is_etf=False, info=None):
-    if is_etf:
-        category = (info or {}).get('category', 'Index') if info else 'Index'
-        return {
-            'is_etf': True,
-            'sector_raw': 'ETF',
-            'sector_display': f"กองทุนดัชนี (ETF: {category})",
-            'industry': category,
-            'fund_score': 25,
-            'val_score': 16,
-            'risk_score': 9,
-            'portfolio_fit': 5,
-            'fwd_pe': 'N/A',
-            'peg': 'N/A',
-            'rev_growth': 'N/A',
-            'market_cap': 0
-        }
-
-    if info is None:
-        try:
-            info = ticker_obj.info or {}
-        except Exception:
-            info = {}
-            
-    q_type = str(info.get('quoteType', '')).upper()
-    if q_type == 'ETF':
-        category = info.get('category', 'Index')
-        return {
-            'is_etf': True,
-            'sector_raw': 'ETF',
-            'sector_display': f"กองทุนดัชนี (ETF: {category})",
-            'industry': category,
-            'fund_score': 25,
-            'val_score': 16,
-            'risk_score': 9,
-            'portfolio_fit': 5,
-            'fwd_pe': 'N/A',
-            'peg': 'N/A',
-            'rev_growth': 'N/A',
-            'market_cap': 0
-        }
-        
-    sec_raw = info.get('sector', 'US Equities')
-    industry = info.get('industry', 'Equities')
-    sec_display = SECTOR_MAP.get(sec_raw, sec_raw if sec_raw else "หุ้นสหรัฐฯ (US Equities)")
-    
-    rev_g = info.get('revenueGrowth', 0) or 0
-    earn_g = info.get('earningsGrowth', 0) or 0
-    fwd_pe = info.get('forwardPE', None)
-    peg = info.get('pegRatio', None)
-    mcap = info.get('marketCap', 0) or 0
-    pm = info.get('profitMargins', 0) or 0
-    roe = info.get('returnOnEquity', 0) or 0
-    
-    # 1. Fundamental Score (Max 30) - Sector Adaptive
-    fund = 15
-    if sec_raw == 'Financial Services':
-        # Banks & Financials: evaluate by ROE and Profit Margins
-        if roe > 0.15: fund += 8
-        elif roe > 0.10: fund += 4
-        if pm > 0.20: fund += 7
-        elif pm > 0.10: fund += 4
-    elif sec_raw in ['Consumer Defensive', 'Utilities', 'Healthcare']:
-        # Defensive / Quality Dividend: steady cash cows
-        if rev_g > 0.10: fund += 6
-        elif rev_g > 0.04: fund += 4
-        if earn_g > 0.10: fund += 6
-        elif earn_g > 0.05: fund += 3
-        if roe > 0.15: fund += 3
+    res = analyze_fundamentals_and_valuation(ticker_obj, is_etf=is_etf, info=info)
+    if res.get('is_etf'):
+        category = res.get('industry', 'Index')
+        res['sector_display'] = f"กองทุนดัชนี (ETF: {category})"
     else:
-        # Tech, Consumer Cyclical, Industrials, Energy, Materials
-        if rev_g > 0.20: fund += 7
-        elif rev_g > 0.10: fund += 4
-        elif rev_g > 0: fund += 2
-        if earn_g > 0.20: fund += 8
-        elif earn_g > 0.10: fund += 4
-    fund = max(0, min(30, fund))
-    
-    # 2. Valuation Score (Max 20) - Sector Adaptive Benchmarks
-    val = 10
-    if peg is not None and peg > 0:
-        if peg < 1.5: val += 8
-        elif peg <= 2.2: val += 5
-        elif peg > 3.0: val -= 3
-    elif fwd_pe is not None and fwd_pe > 0:
-        pe_bench = 18 if sec_raw in ['Financial Services', 'Energy'] else (28 if sec_raw in ['Consumer Defensive', 'Utilities'] else 35)
-        if fwd_pe < pe_bench * 0.8: val += 7
-        elif fwd_pe <= pe_bench * 1.1: val += 4
-        elif fwd_pe > pe_bench * 1.5: val -= 3
-    val = max(0, min(20, val))
-    
-    # 3. Balance Sheet & Risk Score (Max 10)
-    risk = 7
-    if sec_raw == 'Financial Services':
-        risk = 9 if roe > 0.12 else 7
-    else:
-        tot_debt = info.get('totalDebt', 0) or 0
-        fcf = info.get('freeCashflow', 0) or 0
-        if fcf > 0:
-            df = tot_debt / fcf
-            if df < 2.5: risk += 3
-            elif df > 6.0: risk -= 3
-    risk = max(0, min(10, risk))
-    
-    # 4. Portfolio Fit (Max 5) - Scale and Moat Stability
-    if mcap > 200e9:
-        fit = 5 # Mega-Cap Global Anchor
-    elif mcap > 50e9:
-        fit = 4 # Large-Cap Quality Pillar
-    elif mcap > 10e9:
-        fit = 3 # Mid-Cap Solid Performer
-    else:
-        fit = 3
-        
-    return {
-        'is_etf': False,
-        'sector_raw': sec_raw,
-        'sector_display': sec_display,
-        'industry': industry,
-        'fund_score': fund,
-        'val_score': val,
-        'risk_score': risk,
-        'portfolio_fit': fit,
-        'fwd_pe': round(fwd_pe, 1) if fwd_pe else 'N/A',
-        'peg': round(peg, 2) if peg else 'N/A',
-        'rev_growth': f"{round(rev_g*100, 1)}%" if rev_g else 'N/A',
-        'market_cap': mcap
-    }
+        sec_raw = res.get('sector_raw', 'US Equities')
+        res['sector_display'] = SECTOR_MAP.get(sec_raw, sec_raw if sec_raw else "หุ้นสหรัฐฯ (US Equities)")
+    return res
 
 def trim_memory():
     """Forces garbage collection and releases glibc heap memory to OS kernel."""
@@ -1533,6 +1415,11 @@ def build_check_embed(ticker_sym, user_id=None):
     hurdle = ev.get('hurdle', macro['hurdle'])
     action = ev['final_action']
     override_note = f"\n⚠️ **กฎคุมความเสี่ยง:** `{ev['override_reason']}` (ลดจาก {ev['raw_action']} ➔ {action})" if ev.get('override') and ev.get('override_reason') else ""
+    earnings_note = (
+        f"\n📅 **แจ้งเตือนงบการเงิน:** ใกล้ประกาศงบใน `{fund_val['earnings_days']}` วัน (ระวังความผันผวน/Gap ข้ามคืน)"
+        if fund_val.get('earnings_soon') and fund_val.get('earnings_days') is not None
+        else ""
+    )
     
     if action == "BUY":
         color = 0x2ECC71
@@ -1550,7 +1437,7 @@ def build_check_embed(ticker_sym, user_id=None):
     embed = discord.Embed(
         title=f"📊 ผลการประเมินหุ้น: {ticker_sym}",
         description=(
-            f"คำแนะนำ: {action_emoji} **{action}**{override_note}\n"
+            f"คำแนะนำ: {action_emoji} **{action}**{override_note}{earnings_note}\n"
             f"`[{progress_bar}]` **{total_score}/100** (เกณฑ์ซื้อ: {hurdle} คะแนน)\n"
             f"🎯 **ราคาควรเข้าซื้อ:** `{ent['buy_zone_str']}`"
         ),
